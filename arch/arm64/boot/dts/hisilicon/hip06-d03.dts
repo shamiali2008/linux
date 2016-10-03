@@ -25,6 +25,7 @@
 	chosen { };
 };
 
+
 &eth0 {
 	status = "ok";
 };
@@ -58,5 +59,13 @@
 };
 
 &usb_ehci {
+	status = "ok";
+};
+
+&uart0 {
+        status = "ok";
+};
+
+&ipmi0 {
 	status = "ok";
 };
