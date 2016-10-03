@@ -55,11 +55,11 @@
 };
 
 &usb_ohci {
-	status = "ok";
+//	status = "ok";
 };
 
 &usb_ehci {
-	status = "ok";
+//	status = "ok";
 };
 
 &uart0 {
