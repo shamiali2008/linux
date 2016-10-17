@@ -21,6 +21,7 @@
 #include <linux/regmap.h>
 
 #include "pcie-designware.h"
+#include "pcie-hisi.h"
 
 #define PCIE_LTSSM_LINKUP_STATE				0x11
 #define PCIE_LTSSM_STATE_MASK				0x3F
