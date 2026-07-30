@@ -1937,6 +1937,127 @@ vm_fault_t vfio_pci_vmf_insert_pfn(struct vfio_pci_core_device *vdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_vmf_insert_pfn);
 
+/*
+ * Whether a fault which found access blocked is worth retrying. Read
+ * without recovery_lock, so it is only a hint about when to look again.
+ * vfio_pci_fault_trylock_once() takes the lock and decides. Read the flags
+ * once so the two tests below see the same value. Every writer which can
+ * make this true wakes pci_recovery_wait.
+ */
+static bool vfio_pci_recovery_done(struct vfio_pci_core_device *vdev)
+{
+	u32 flags = READ_ONCE(vdev->pci_recovery_flags);
+
+	if (!READ_ONCE(vdev->pci_recovery_device_open))
+		return true;
+	if (flags & VFIO_PCI_RECOVERY_IN_PROGRESS)
+		return false;
+	if (flags & VFIO_PCI_RECOVERY_FAILED)
+		return true;
+	return !READ_ONCE(vdev->pci_recovery_access_blocked);
+}
+
+static int vfio_pci_wait_for_recovery(struct vfio_pci_core_device *vdev)
+{
+	return wait_event_killable(vdev->pci_recovery_wait,
+				   vfio_pci_recovery_done(vdev));
+}
+
+/* What one look at the recovery state says the fault should do. */
+enum vfio_pci_fault_action {
+	VFIO_PCI_FAULT_PROCEED,	/* returns with memory_lock held */
+	VFIO_PCI_FAULT_WAIT,	/* recovery is running, may still recover */
+	VFIO_PCI_FAULT_FAIL,	/* closed, or failed for good */
+};
+
+static enum vfio_pci_fault_action
+vfio_pci_fault_trylock_once(struct vfio_pci_core_device *vdev)
+{
+	enum vfio_pci_fault_action action;
+
+	down_read(&vdev->recovery_lock);
+	if (!vdev->pci_recovery_device_open ||
+	    (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_FAILED)) {
+		action = VFIO_PCI_FAULT_FAIL;
+	} else if (vdev->pci_recovery_access_blocked) {
+		/*
+		 * Blocked for a reason which still ends: a recovery which has
+		 * not failed, or a function reset. Test FAILED above rather
+		 * than IN_PROGRESS here, so a fault does not fail for good
+		 * while a reset is running, or in the window where
+		 * error_detected() has blocked access but not yet published
+		 * the flags.
+		 */
+		action = VFIO_PCI_FAULT_WAIT;
+	} else {
+		down_read(&vdev->memory_lock);
+		action = VFIO_PCI_FAULT_PROCEED;
+	}
+	up_read(&vdev->recovery_lock);
+
+	return action;
+}
+
+/*
+ * Return true with memory_lock held for a fault that may proceed. Otherwise
+ * return false with @ret set to the result the fault handler should return.
+ */
+static bool vfio_pci_core_fault_trylock(struct vfio_pci_core_device *vdev,
+					struct vm_fault *vmf,
+					vm_fault_t *ret)
+{
+	if (!vdev->pci_recovery_supported) {
+		down_read(&vdev->memory_lock);
+		return true;
+	}
+
+	switch (vfio_pci_fault_trylock_once(vdev)) {
+	case VFIO_PCI_FAULT_PROCEED:
+		return true;
+	case VFIO_PCI_FAULT_FAIL:
+		*ret = VM_FAULT_SIGBUS;
+		return false;
+	case VFIO_PCI_FAULT_WAIT:
+		break;
+	}
+
+	if (fault_flag_allow_retry_first(vmf->flags)) {
+		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT) {
+			*ret = VM_FAULT_RETRY;
+			return false;
+		}
+
+		if (!vfio_device_try_get_registration(&vdev->vdev)) {
+			*ret = VM_FAULT_SIGBUS;
+			return false;
+		}
+
+		release_fault_lock(vmf);
+		vfio_pci_wait_for_recovery(vdev);
+		vfio_device_put_registration(&vdev->vdev);
+		*ret = VM_FAULT_RETRY;
+		return false;
+	}
+
+	/*
+	 * The fault lock cannot be dropped here: either the caller did not
+	 * allow a retry, or this fault has already used one. So wait with
+	 * it held. It is not a deadlock. Recovery revokes mappings through
+	 * unmap_mapping_range(), which never takes mmap_lock. The wait is
+	 * killable.
+	 */
+	if (vfio_pci_wait_for_recovery(vdev)) {
+		*ret = VM_FAULT_NOPAGE;
+		return false;
+	}
+
+	if (vfio_pci_fault_trylock_once(vdev) == VFIO_PCI_FAULT_PROCEED)
+		return true;
+
+	*ret = VM_FAULT_SIGBUS;
+	return false;
+}
+
 static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
 					   unsigned int order)
 {
@@ -1948,8 +2069,11 @@ static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	if (is_aligned_for_order(vma, addr, pfn, order)) {
-		scoped_guard(rwsem_read, &vdev->memory_lock)
-			ret = vfio_pci_vmf_insert_pfn(vdev, vmf, pfn, order);
+		if (!vfio_pci_core_fault_trylock(vdev, vmf, &ret))
+			return ret;
+
+		ret = vfio_pci_vmf_insert_pfn(vdev, vmf, pfn, order);
+		up_read(&vdev->memory_lock);
 	}
 
 	dev_dbg_ratelimited(&vdev->pdev->dev,
