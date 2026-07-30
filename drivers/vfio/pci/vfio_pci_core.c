@@ -591,9 +591,22 @@ static const struct dev_pm_ops vfio_pci_core_pm_ops = {
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
+	bool supported = vdev->pci_recovery_supported;
 	int ret;
 	u16 cmd;
 	u8 msix_pos;
+
+	if (supported) {
+		down_write(&vdev->recovery_lock);
+		if (pci_dev_is_disconnected(pdev)) {
+			up_write(&vdev->recovery_lock);
+			return -ENODEV;
+		}
+
+		vdev->pci_recovery_command_valid = false;
+		WRITE_ONCE(vdev->pci_recovery_device_open, false);
+		up_write(&vdev->recovery_lock);
+	}
 
 	if (!vdev->disable_idle_d3) {
 		ret = pm_runtime_resume_and_get(&pdev->dev);
@@ -815,7 +828,40 @@ out:
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_disable);
 
-void vfio_pci_core_close_device(struct vfio_device *core_vdev)
+static void vfio_pci_core_prepare_close(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->pci_recovery_supported)
+		return;
+
+	down_write(&vdev->recovery_lock);
+	WRITE_ONCE(vdev->pci_recovery_enabled, false);
+	vdev->pci_recovery_command_valid = false;
+	/*
+	 * Clear access_blocked before device_open, so a lock-free reader
+	 * never sees it set on a device which is no longer open. A
+	 * transaction which is still running cannot clear it once
+	 * device_open is gone, and paths which refuse work on a blocked
+	 * device would then refuse it for good.
+	 */
+	WRITE_ONCE(vdev->pci_recovery_access_blocked, false);
+	WRITE_ONCE(vdev->pci_recovery_device_open, false);
+	WRITE_ONCE(vdev->pci_recovery_flags, 0);
+
+	/*
+	 * Publish the closing state and drop recovery_lock before any
+	 * teardown. Recovery is disabled and its state cleared, so
+	 * slot_reset() and resume() become no-ops and a later
+	 * error_detected() only follows the legacy notification path.
+	 * Holding the lock across vfio_pci_core_disable() protects nothing
+	 * and inverts the lock order. disable() reaches pci_reset_bus(),
+	 * which takes pci_bus_sem, while error_detected() takes
+	 * recovery_lock from under pci_bus_sem.
+	 */
+	up_write(&vdev->recovery_lock);
+	wake_up_all(&vdev->pci_recovery_wait);
+}
+
+static void vfio_pci_core_finish_close(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
@@ -838,6 +884,15 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 	vfio_pci_eventfd_replace_locked(vdev, &vdev->req_trigger, NULL);
 	mutex_unlock(&vdev->igate);
 }
+
+void vfio_pci_core_close_device(struct vfio_device *core_vdev)
+{
+	struct vfio_pci_core_device *vdev =
+		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+
+	vfio_pci_core_prepare_close(vdev);
+	vfio_pci_core_finish_close(core_vdev);
+}
 EXPORT_SYMBOL_GPL(vfio_pci_core_close_device);
 
 void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
@@ -851,6 +906,18 @@ void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
 		mutex_lock(&vdev->sriov_pf_core_dev->vf_token->lock);
 		vdev->sriov_pf_core_dev->vf_token->users++;
 		mutex_unlock(&vdev->sriov_pf_core_dev->vf_token->lock);
+	}
+
+	if (vdev->pci_recovery_supported) {
+		down_write(&vdev->recovery_lock);
+		WRITE_ONCE(vdev->pci_recovery_flags, 0);
+		vdev->pci_recovery_sequence = 0;
+		WRITE_ONCE(vdev->pci_recovery_enabled, false);
+		/* Close clears this too. Start unblocked either way. */
+		WRITE_ONCE(vdev->pci_recovery_access_blocked, false);
+		WRITE_ONCE(vdev->pci_recovery_device_open, true);
+		WRITE_ONCE(vdev->pci_recovery_rom_disable, false);
+		up_write(&vdev->recovery_lock);
 	}
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_finish_enable);
