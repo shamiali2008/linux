@@ -95,6 +95,11 @@ static inline int vfio_pci_core_get_dmabuf_phys(
 }
 #endif
 
+#define VFIO_PCI_RECOVERY_IN_PROGRESS	BIT(0)
+#define VFIO_PCI_RECOVERY_FROZEN	BIT(1)
+#define VFIO_PCI_RECOVERY_RESET		BIT(2)
+#define VFIO_PCI_RECOVERY_FAILED	BIT(3)
+
 struct vfio_pci_core_device {
 	struct vfio_device	vdev;
 	struct pci_dev		*pdev;
@@ -129,6 +134,7 @@ struct vfio_pci_core_device {
 	bool			disable_idle_d3:1;
 	bool			nointxmask:1;
 	bool			disable_vga:1;
+	bool			pci_recovery_supported:1;
 	/* Flags modified at runtime - dedicated storage unit */
 	bool			needs_reset;
 	bool			pm_intx_masked;
@@ -147,7 +153,60 @@ struct vfio_pci_core_device {
 	struct list_head		sriov_pfs_item;
 	struct vfio_pci_core_device	*sriov_pf_core_dev;
 	struct notifier_block	nb;
+	/*
+	 * Serializes host PCI error recovery with device access and the
+	 * open/close lifecycle. recovery_lock nests outside memory_lock.
+	 */
+	struct rw_semaphore	recovery_lock;
 	struct rw_semaphore	memory_lock;
+	/*
+	 * PCI error recovery state, written under recovery_lock held for
+	 * writing except where noted.
+	 *
+	 * Some readers cannot take recovery_lock. An interrupt handler cannot
+	 * sleep. The ioeventfd write runs on a workqueue which is flushed with
+	 * the lock held, so it would block behind a queued writer. A
+	 * wait-queue condition cannot take it either. Some checks would refuse
+	 * work against ordinary device traffic if they took it. Work deferred
+	 * past the guard has none to take, since it reaches pci_bus_sem.
+	 *
+	 * Those readers use READ_ONCE() on pci_recovery_flags,
+	 * pci_recovery_enabled, pci_recovery_access_blocked and
+	 * pci_recovery_device_open instead. All of them fail safe. A stale
+	 * read costs an extra refusal or retry, never an unguarded access.
+	 *
+	 * recovery_lock does not exclude those readers, so publish each field
+	 * with a single store of its final value rather than clearing and
+	 * then setting. That keeps the states a reader can observe to ones
+	 * which are meaningful on their own.
+	 *
+	 * device_open and access_blocked mean different things. device_open
+	 * says the device is open and its per-open state, vconfig included,
+	 * is allocated. access_blocked says a recovery or reset is blocking
+	 * access right now.
+	 *
+	 * access_blocked is only ever set while device_open is set. Nothing
+	 * sets it without testing device_open first under recovery_lock, and
+	 * close clears access_blocked before it clears device_open, so a
+	 * block never outlives the open which created it. A reader which
+	 * finds access_blocked set can rely on the per-open state being
+	 * there with it.
+	 */
+	u32			pci_recovery_flags;
+	u64			pci_recovery_sequence;
+	/* PCI_COMMAND value saved before recovery quiesces the device. */
+	u16			pci_recovery_command;
+	/* Userspace enabled recovery for this device open. */
+	bool			pci_recovery_enabled;
+	/* pci_recovery_command contains a restorable value. */
+	bool			pci_recovery_command_valid;
+	/* A recovery or reset transaction is blocking physical access. */
+	bool			pci_recovery_access_blocked;
+	/* Device initialization completed and close teardown has not started. */
+	bool			pci_recovery_device_open;
+	/* May be set while recovery_lock is held for reading during ROM unmap. */
+	bool			pci_recovery_rom_disable;
+	wait_queue_head_t	pci_recovery_wait;
 	struct list_head	dmabufs;
 };
 

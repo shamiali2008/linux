@@ -2196,7 +2196,9 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 	if (ret && ret != -EOPNOTSUPP)
 		return ret;
 	INIT_LIST_HEAD(&vdev->dmabufs);
+	init_rwsem(&vdev->recovery_lock);
 	init_rwsem(&vdev->memory_lock);
+	init_waitqueue_head(&vdev->pci_recovery_wait);
 	xa_init(&vdev->ctx);
 
 	return 0;
