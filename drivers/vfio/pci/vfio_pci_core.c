@@ -893,6 +893,10 @@ static void vfio_pci_core_finish_close(struct vfio_device *core_vdev)
 	mutex_lock(&vdev->igate);
 	vfio_pci_eventfd_replace_locked(vdev, &vdev->err_trigger, NULL);
 	vfio_pci_eventfd_replace_locked(vdev, &vdev->req_trigger, NULL);
+	if (vdev->pci_recovery_supported)
+		vfio_pci_eventfd_replace_locked(vdev,
+						&vdev->pci_recovery_trigger,
+						NULL);
 	mutex_unlock(&vdev->igate);
 }
 
@@ -1850,6 +1854,106 @@ static int vfio_pci_core_feature_token(struct vfio_pci_core_device *vdev,
 	return 0;
 }
 
+static int
+vfio_pci_core_feature_error_recovery(struct vfio_pci_core_device *vdev, u32 flags,
+				     struct vfio_device_pci_error_recovery __user *arg,
+				     size_t argsz)
+{
+	struct vfio_device_pci_error_recovery state = { .eventfd = -1 };
+	struct eventfd_ctx *ctx = NULL;
+	bool enable;
+	int ret;
+
+	if (!vdev->pci_recovery_supported)
+		return -ENOTTY;
+
+	ret = vfio_check_feature(flags, argsz,
+				 VFIO_DEVICE_FEATURE_GET |
+				 VFIO_DEVICE_FEATURE_SET, sizeof(state));
+	if (ret != 1)
+		return ret;
+
+	if (flags & VFIO_DEVICE_FEATURE_GET) {
+		down_read(&vdev->recovery_lock);
+		if (vdev->pci_recovery_enabled)
+			state.flags |= VFIO_PCI_ERROR_RECOVERY_ENABLED;
+		if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS)
+			state.flags |= VFIO_PCI_ERROR_RECOVERY_IN_PROGRESS;
+		if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_FROZEN)
+			state.flags |=
+				VFIO_PCI_ERROR_RECOVERY_CHANNEL_FROZEN;
+		if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_RESET)
+			state.flags |= VFIO_PCI_ERROR_RECOVERY_DEVICE_RESET;
+		if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_FAILED)
+			state.flags |= VFIO_PCI_ERROR_RECOVERY_FAILED;
+		state.sequence = vdev->pci_recovery_sequence;
+		up_read(&vdev->recovery_lock);
+
+		if (copy_to_user(arg, &state, sizeof(state)))
+			return -EFAULT;
+		return 0;
+	}
+
+	if (copy_from_user(&state, arg, sizeof(state)))
+		return -EFAULT;
+	if (state.flags || state.sequence || state.eventfd < -1)
+		return -EINVAL;
+
+	enable = state.eventfd >= 0;
+	if (enable) {
+		ctx = eventfd_ctx_fdget(state.eventfd);
+		if (IS_ERR(ctx))
+			return PTR_ERR(ctx);
+	}
+
+	down_write(&vdev->recovery_lock);
+	if (!vdev->pci_recovery_device_open) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (vdev->pci_recovery_access_blocked) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	if (!enable &&
+	    (vdev->pci_recovery_flags &
+	     (VFIO_PCI_RECOVERY_IN_PROGRESS | VFIO_PCI_RECOVERY_FAILED))) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	mutex_lock(&vdev->igate);
+	ret = vfio_pci_eventfd_replace_locked(vdev,
+					      &vdev->pci_recovery_trigger,
+					      ctx);
+	mutex_unlock(&vdev->igate);
+	if (ret)
+		goto out_unlock;
+
+	WRITE_ONCE(vdev->pci_recovery_enabled, enable);
+	/*
+	 * Start each enabled period from a clear state, so a sequence number
+	 * and the status bits beside it always describe an event this
+	 * eventfd was notified of. Nothing is in flight to lose. A
+	 * transaction holds access_blocked, which failed this call with
+	 * -EBUSY above.
+	 *
+	 * access_blocked itself is not cleared here, so userspace can never
+	 * disable its way out of a block.
+	 */
+	WRITE_ONCE(vdev->pci_recovery_flags, 0);
+	vdev->pci_recovery_sequence = 0;
+	vdev->pci_recovery_command_valid = false;
+
+out_unlock:
+	up_write(&vdev->recovery_lock);
+	if (ret && ctx)
+		eventfd_ctx_put(ctx);
+
+	return ret;
+}
+
 int vfio_pci_core_ioctl_feature(struct vfio_device *device, u32 flags,
 				void __user *arg, size_t argsz)
 {
@@ -1870,6 +1974,9 @@ int vfio_pci_core_ioctl_feature(struct vfio_device *device, u32 flags,
 		return vfio_pci_core_feature_dma_buf(vdev, flags, arg, argsz);
 	case VFIO_DEVICE_FEATURE_ZPCI_ERROR:
 		return vfio_pci_zdev_feature_err(device, flags, arg, argsz);
+
+	case VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY:
+		return vfio_pci_core_feature_error_recovery(vdev, flags, arg, argsz);
 	default:
 		return -ENOTTY;
 	}
@@ -2741,6 +2848,18 @@ void vfio_pci_core_unregister_device(struct vfio_pci_core_device *vdev)
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_device);
 
+static void
+vfio_pci_signal_recovery_event(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_eventfd *eventfd;
+
+	rcu_read_lock();
+	eventfd = rcu_dereference(vdev->pci_recovery_trigger);
+	if (eventfd)
+		eventfd_signal(eventfd->ctx);
+	rcu_read_unlock();
+}
+
 pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 						pci_channel_state_t state)
 {
@@ -2748,6 +2867,7 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 	struct vfio_pci_eventfd *eventfd;
 	pci_ers_result_t result = PCI_ERS_RESULT_CAN_RECOVER;
 	unsigned long irq_flags;
+	bool notify_recovery = false;
 	bool terminal = false;
 	bool nested;
 	u32 flags;
@@ -2792,6 +2912,7 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 		goto out_unlock;
 	}
 
+	notify_recovery = true;
 	WRITE_ONCE(vdev->pci_recovery_access_blocked, true);
 	/*
 	 * A second event before resume() has finished the first joins the
@@ -2916,6 +3037,8 @@ out:
 	if (eventfd)
 		eventfd_signal(eventfd->ctx);
 	rcu_read_unlock();
+	if (notify_recovery)
+		vfio_pci_signal_recovery_event(vdev);
 
 	return result;
 }
@@ -2981,13 +3104,15 @@ static pci_ers_result_t vfio_pci_core_aer_slot_reset(struct pci_dev *pdev)
 
 	up_write(&vdev->recovery_lock);
 	/*
-	 * Whoever clears IN_PROGRESS owes the wake. resume() will not do it,
-	 * since it bails once IN_PROGRESS is clear, and the core skips it
-	 * altogether if the domain verdict is not RECOVERED. On success the
-	 * transaction carries on and resume() wakes.
+	 * Whoever clears IN_PROGRESS owes the wake and the event. resume()
+	 * will not do it, since it bails once IN_PROGRESS is clear, and the
+	 * core skips it altogether if the domain verdict is not RECOVERED.
+	 * On success the transaction carries on and resume() does both.
 	 */
-	if (ret)
+	if (ret) {
 		wake_up_all(&vdev->pci_recovery_wait);
+		vfio_pci_signal_recovery_event(vdev);
+	}
 
 	return result;
 }
@@ -2996,6 +3121,7 @@ static void vfio_pci_core_aer_resume(struct pci_dev *pdev)
 {
 	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
 	unsigned long irq_flags;
+	bool notify_recovery = false;
 	u32 flags;
 	int ret = 0;
 
@@ -3011,6 +3137,7 @@ static void vfio_pci_core_aer_resume(struct pci_dev *pdev)
 	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS))
 		goto out_unlock;
 
+	notify_recovery = true;
 	if (!vdev->pci_recovery_device_open) {
 		vdev->pci_recovery_command_valid = false;
 		WRITE_ONCE(vdev->pci_recovery_flags,
@@ -3056,7 +3183,10 @@ static void vfio_pci_core_aer_resume(struct pci_dev *pdev)
 
 out_unlock:
 	up_write(&vdev->recovery_lock);
-	wake_up_all(&vdev->pci_recovery_wait);
+	if (notify_recovery) {
+		wake_up_all(&vdev->pci_recovery_wait);
+		vfio_pci_signal_recovery_event(vdev);
+	}
 }
 
 int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,

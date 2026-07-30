@@ -1555,6 +1555,75 @@ struct vfio_device_feature_zpci_err {
 
 #define VFIO_DEVICE_FEATURE_ZPCI_ERROR 13
 
+/*
+ * Report host PCI error recovery state for this device.
+ *
+ * The sequence number is incremented at the start of each event and remains
+ * unchanged for its subsequent state changes. Userspace can therefore
+ * distinguish a new event from completion of the current one and detect
+ * coalesced notifications. It restarts from zero each time recovery is
+ * enabled, so it is only meaningful within one enabled period.
+ *
+ * ENABLED reports that userspace has enabled recovery.
+ * CHANNEL_FROZEN records that recovery started with the PCI channel frozen.
+ * DEVICE_RESET records that the host reset the device. FAILED records that
+ * recovery did not complete successfully. Event status bits remain set after
+ * IN_PROGRESS is cleared. A new event supersedes status from a previous
+ * successful event. FAILED is terminal for the current device open and
+ * remains set until the device is closed and reopened.
+ *
+ * Status bits may also be set while IN_PROGRESS is still set, describing the
+ * event so far. Act on them once IN_PROGRESS is clear. Device access is
+ * refused with -EIO until then.
+ *
+ * When DEVICE_RESET is reported the host reset the device, which tears down
+ * the interrupt configuration the user had established. INTx, MSI and MSI-X
+ * must be re-armed with VFIO_DEVICE_SET_IRQS before interrupts resume.
+ *
+ * VFIO_DEVICE_FEATURE_GET returns the current state and -1 in eventfd. GET is
+ * never refused, including while recovery blocks device access, so that
+ * userspace can read this state during an event. It can wait for a recovery
+ * callback which is already running.
+ *
+ * IN_PROGRESS is not guaranteed to be observable. A recovery which needs no
+ * device reset can complete within microseconds of the notification, before
+ * userspace is scheduled, so a GET which follows the eventfd may already see
+ * IN_PROGRESS clear. Userspace must treat a notification as "an event
+ * occurred" and read the sequence number and the status bits to learn what
+ * happened. It must not wait for IN_PROGRESS to appear set.
+ *
+ * VFIO_DEVICE_FEATURE_SET with a valid eventfd enables recovery
+ * and installs the eventfd as a notification for recovery start and terminal
+ * completion. SET with eventfd -1 disables recovery when none
+ * is in progress and the latest event has not failed. SET returns -EBUSY when
+ * any of those restrictions prevents the requested transition, including while
+ * an explicit VFIO_DEVICE_RESET blocks device access, and -ENODEV if device
+ * close has begun. flags and sequence must be zero for SET.
+ *
+ * This eventfd is separate from VFIO_PCI_ERR_IRQ_INDEX and additional to it.
+ * VFIO_PCI_ERR_IRQ_INDEX keeps reporting errors as it does today whether or
+ * not this feature is enabled, so a user of both receives two notifications
+ * for one event.
+ *
+ * Enabling recovery does not recover an event which is already being handled
+ * for this device. Such an event was declined before it started, so it
+ * completes without notification and without status, even though the host may
+ * reset the device as part of it. Enable recovery before errors occur rather
+ * than in response to one.
+ */
+struct vfio_device_pci_error_recovery {
+	__u32 flags;
+#define VFIO_PCI_ERROR_RECOVERY_IN_PROGRESS	(1U << 0)
+#define VFIO_PCI_ERROR_RECOVERY_CHANNEL_FROZEN	(1U << 1)
+#define VFIO_PCI_ERROR_RECOVERY_DEVICE_RESET	(1U << 2)
+#define VFIO_PCI_ERROR_RECOVERY_FAILED		(1U << 3)
+#define VFIO_PCI_ERROR_RECOVERY_ENABLED		(1U << 4)
+	__s32 eventfd;
+	__aligned_u64 sequence;
+};
+
+#define VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY 14
+
 /* -------- API for Type1 VFIO IOMMU -------- */
 
 /**
