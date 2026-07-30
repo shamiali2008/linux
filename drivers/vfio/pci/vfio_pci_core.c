@@ -2746,14 +2746,178 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 {
 	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
 	struct vfio_pci_eventfd *eventfd;
+	pci_ers_result_t result = PCI_ERS_RESULT_CAN_RECOVER;
+	unsigned long irq_flags;
+	bool terminal = false;
+	bool nested;
+	u32 flags;
+	int ret;
 
+	if (!vdev->pci_recovery_supported ||
+	    !READ_ONCE(vdev->pci_recovery_enabled))
+		goto out;
+
+	down_write(&vdev->recovery_lock);
+	if (!vdev->pci_recovery_enabled)
+		goto out_unlock;
+
+	/*
+	 * A failed device remains blocked until close and a new open have
+	 * reinitialized it. A later bridge event cannot make the saved VFIO
+	 * state valid again.
+	 */
+	if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_FAILED) {
+		result = PCI_ERS_RESULT_NONE;
+		goto out_unlock;
+	}
+
+	if (!vdev->pci_recovery_device_open) {
+		result = PCI_ERS_RESULT_NONE;
+		/*
+		 * PCI core rebroadcasts permanent failure when subtree
+		 * recovery fails. Complete an event which started before
+		 * close so a later open is not permanently stuck on
+		 * IN_PROGRESS.
+		 */
+		if (state == pci_channel_io_perm_failure &&
+		    (vdev->pci_recovery_flags &
+		     VFIO_PCI_RECOVERY_IN_PROGRESS)) {
+			WRITE_ONCE(vdev->pci_recovery_flags,
+				   (vdev->pci_recovery_flags |
+				    VFIO_PCI_RECOVERY_FAILED) &
+				   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+			vdev->pci_recovery_command_valid = false;
+			terminal = true;
+		}
+		goto out_unlock;
+	}
+
+	WRITE_ONCE(vdev->pci_recovery_access_blocked, true);
+	/*
+	 * A second event before resume() has finished the first joins the
+	 * transaction already running rather than starting one. Keep its
+	 * sequence number, the command word it saved before the device was
+	 * quiesced, and any reset a slot_reset() in between recorded. Reading
+	 * the command word again here would save the quiesced value, and
+	 * restoring that leaves the device with bus mastering off.
+	 */
+	nested = vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS;
+	if (!nested)
+		vdev->pci_recovery_command_valid = false;
+	vfio_pci_intx_recovery_start(vdev);
+	/*
+	 * INTx hardirq and virqfd callbacks cannot take recovery_lock.
+	 * For devices with per-function INTx masking, mask INTx while holding
+	 * irqlock so a callback which passed its blocked-state check is drained
+	 * before the temporary command value is installed. Devices without
+	 * per-function masking were quiesced above through genirq.
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	ret = 0;
+	if (state == pci_channel_io_normal && vdev->pci_2_3 && !nested) {
+		u16 command;
+
+		ret = pci_read_config_word(pdev, PCI_COMMAND,
+					   &vdev->pci_recovery_command);
+		/*
+		 * A read from a device which has stopped responding succeeds
+		 * and returns all ones. Writing that back would set every
+		 * command bit, and saving it would restore them at the end.
+		 */
+		if (!ret && PCI_POSSIBLE_ERROR(vdev->pci_recovery_command))
+			ret = -EIO;
+		if (!ret) {
+			command = (vdev->pci_recovery_command &
+				   ~PCI_COMMAND_MASTER) |
+				  PCI_COMMAND_INTX_DISABLE;
+			ret = pci_write_config_word(pdev, PCI_COMMAND, command);
+		}
+		if (!ret)
+			vdev->pci_recovery_command_valid = true;
+	}
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+	vfio_pci_zap_and_down_write_memory_lock(vdev);
+	vfio_pci_dma_buf_move(vdev, true);
+
+	/*
+	 * Allocate a sequence for a new transaction, and drop the flags the
+	 * previous one left behind for userspace to read. A nested event adds
+	 * to the flags already there. Each path below publishes the result in
+	 * one store, so a lock-free reader never observes a cleared state that
+	 * looks like successful completion.
+	 */
+	flags = vdev->pci_recovery_flags;
+	if (!nested) {
+		if (++vdev->pci_recovery_sequence == 0)
+			vdev->pci_recovery_sequence++;
+		flags = 0;
+	}
+
+	if (state == pci_channel_io_perm_failure) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   (flags | VFIO_PCI_RECOVERY_FAILED) &
+			   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+		vdev->pci_recovery_command_valid = false;
+		result = PCI_ERS_RESULT_DISCONNECT;
+		terminal = true;
+		goto out_memory;
+	}
+
+	if (state == pci_channel_io_frozen) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   flags | VFIO_PCI_RECOVERY_IN_PROGRESS |
+			   VFIO_PCI_RECOVERY_FROZEN);
+		result = PCI_ERS_RESULT_NEED_RESET;
+		goto out_memory;
+	}
+
+	WRITE_ONCE(vdev->pci_recovery_flags,
+		   flags | VFIO_PCI_RECOVERY_IN_PROGRESS);
+	if (ret)
+		goto out_failed;
+	if (vdev->pci_2_3 || nested)
+		goto out_memory;
+
+	ret = pci_read_config_word(pdev, PCI_COMMAND,
+				   &vdev->pci_recovery_command);
+	if (ret)
+		goto out_failed;
+
+	if (PCI_POSSIBLE_ERROR(vdev->pci_recovery_command)) {
+		ret = -EIO;
+		goto out_failed;
+	}
+
+	ret = pci_write_config_word(pdev, PCI_COMMAND,
+				    vdev->pci_recovery_command &
+				    ~PCI_COMMAND_MASTER);
+	if (ret)
+		goto out_failed;
+
+	vdev->pci_recovery_command_valid = true;
+	goto out_memory;
+
+out_failed:
+	WRITE_ONCE(vdev->pci_recovery_flags,
+		   (vdev->pci_recovery_flags | VFIO_PCI_RECOVERY_FAILED) &
+		   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+	result = PCI_ERS_RESULT_NONE;
+	terminal = true;
+out_memory:
+	up_write(&vdev->memory_lock);
+out_unlock:
+	up_write(&vdev->recovery_lock);
+	if (terminal)
+		wake_up_all(&vdev->pci_recovery_wait);
+
+out:
 	rcu_read_lock();
 	eventfd = rcu_dereference(vdev->err_trigger);
 	if (eventfd)
 		eventfd_signal(eventfd->ctx);
 	rcu_read_unlock();
 
-	return PCI_ERS_RESULT_CAN_RECOVER;
+	return result;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_err_detected);
 
