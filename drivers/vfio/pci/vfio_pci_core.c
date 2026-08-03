@@ -1244,6 +1244,9 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 			 * Check ROM content is valid. Need to enable memory
 			 * decode for ROM access in pci_map_rom().
 			 */
+			ret = vfio_pci_core_access_begin(vdev);
+			if (ret)
+				return ret;
 			cmd = vfio_pci_memory_lock_and_enable(vdev);
 			io = pci_map_rom(pdev, &size);
 			if (io) {
@@ -1254,6 +1257,7 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 				pci_unmap_rom(pdev, io);
 			}
 			vfio_pci_memory_unlock_and_restore(vdev, cmd);
+			vfio_pci_core_access_end(vdev);
 		} else if (pdev->rom && pdev->romlen) {
 			info->flags = VFIO_REGION_INFO_FLAG_READ;
 			/* Report BAR size as power of two. */
@@ -1379,6 +1383,30 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 	return ret;
 }
 
+/*
+ * Complete a ROM unmap which could not disable decode through config space.
+ * Call once whatever blocked access has finished. A closed device is skipped.
+ * It runs without recovery_lock, and close puts the device back through reset
+ * and config restore.
+ *
+ * The IORESOURCE_ROM_ENABLE test is what pci_unmap_rom() would have done.
+ * A ROM which firmware left enabled is not ours to turn off.
+ */
+static void vfio_pci_recovery_rom_disable(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+
+	lockdep_assert_held_write(&vdev->recovery_lock);
+
+	if (!vdev->pci_recovery_device_open ||
+	    !READ_ONCE(vdev->pci_recovery_rom_disable))
+		return;
+
+	if (!(pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_ENABLE))
+		pci_disable_rom(pdev);
+	WRITE_ONCE(vdev->pci_recovery_rom_disable, false);
+}
+
 int vfio_pci_try_reset_function(struct vfio_pci_core_device *vdev,
 				bool reset_power_state)
 {
@@ -1455,8 +1483,10 @@ int vfio_pci_try_reset_function(struct vfio_pci_core_device *vdev,
 		 */
 		if (vdev->pci_recovery_device_open &&
 		    !(vdev->pci_recovery_flags & (VFIO_PCI_RECOVERY_IN_PROGRESS |
-						  VFIO_PCI_RECOVERY_FAILED)))
+						  VFIO_PCI_RECOVERY_FAILED))) {
+			vfio_pci_recovery_rom_disable(vdev);
 			WRITE_ONCE(vdev->pci_recovery_access_blocked, false);
+		}
 		up_write(&vdev->recovery_lock);
 		/*
 		 * Access is blocked for the length of the reset, so anything

@@ -42,10 +42,17 @@
 int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,	\
 			bool test_mem, u##size val, void __iomem *io)	\
 {									\
+	int ret;							\
+									\
+	ret = vfio_pci_core_access_begin(vdev);				\
+	if (ret)							\
+		return ret;						\
+									\
 	if (test_mem) {							\
 		down_read(&vdev->memory_lock);				\
 		if (!__vfio_pci_memory_enabled(vdev)) {			\
 			up_read(&vdev->memory_lock);			\
+			vfio_pci_core_access_end(vdev);			\
 			return -EIO;					\
 		}							\
 	}								\
@@ -54,6 +61,7 @@ int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,	\
 									\
 	if (test_mem)							\
 		up_read(&vdev->memory_lock);				\
+	vfio_pci_core_access_end(vdev);					\
 									\
 	return 0;							\
 }									\
@@ -68,10 +76,17 @@ VFIO_IOWRITE(64)
 int vfio_pci_core_ioread##size(struct vfio_pci_core_device *vdev,	\
 			bool test_mem, u##size *val, void __iomem *io)	\
 {									\
+	int ret;							\
+									\
+	ret = vfio_pci_core_access_begin(vdev);				\
+	if (ret)							\
+		return ret;						\
+									\
 	if (test_mem) {							\
 		down_read(&vdev->memory_lock);				\
 		if (!__vfio_pci_memory_enabled(vdev)) {			\
 			up_read(&vdev->memory_lock);			\
+			vfio_pci_core_access_end(vdev);			\
 			return -EIO;					\
 		}							\
 	}								\
@@ -80,6 +95,7 @@ int vfio_pci_core_ioread##size(struct vfio_pci_core_device *vdev,	\
 									\
 	if (test_mem)							\
 		up_read(&vdev->memory_lock);				\
+	vfio_pci_core_access_end(vdev);					\
 									\
 	return 0;							\
 }									\
@@ -198,12 +214,41 @@ ssize_t vfio_pci_core_do_io_rw(struct vfio_pci_core_device *vdev, bool test_mem,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_do_io_rw);
 
+/*
+ * Undo pci_map_rom(). The iounmap is always safe, but pci_disable_rom() is a
+ * config space write. If recovery has blocked access, do the iounmap now and
+ * record the disable, for whichever of resume() or the reset tail unblocks
+ * access again. recovery_lock spans the decision and the record so recovery
+ * cannot complete in between.
+ */
+static void vfio_pci_unmap_rom(struct vfio_pci_core_device *vdev,
+			       void __iomem *io)
+{
+	struct pci_dev *pdev = vdev->pdev;
+
+	if (!vdev->pci_recovery_supported) {
+		pci_unmap_rom(pdev, io);
+		return;
+	}
+
+	down_read(&vdev->recovery_lock);
+	if (vdev->pci_recovery_device_open &&
+	    !vdev->pci_recovery_access_blocked) {
+		pci_unmap_rom(pdev, io);
+	} else {
+		iounmap(io);
+		WRITE_ONCE(vdev->pci_recovery_rom_disable, true);
+	}
+	up_read(&vdev->recovery_lock);
+}
+
 ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
 	int bar = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
+	int ret;
 	size_t x_start = 0, x_end = 0;
 	resource_size_t end;
 	void __iomem *io;
@@ -230,7 +275,11 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 		 * filling large ROM BARs much faster.
 		 */
 		if (pci_resource_start(pdev, bar)) {
+			ret = vfio_pci_core_access_begin(vdev);
+			if (ret)
+				return ret;
 			io = pci_map_rom(pdev, &x_start);
+			vfio_pci_core_access_end(vdev);
 		} else {
 			io = ioremap(pdev->rom, pdev->romlen);
 			x_start = pdev->romlen;
@@ -269,7 +318,7 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 
 	if (bar == PCI_ROM_RESOURCE) {
 		if (pci_resource_start(pdev, bar))
-			pci_unmap_rom(pdev, io);
+			vfio_pci_unmap_rom(vdev, io);
 		else
 			iounmap(io);
 	}
