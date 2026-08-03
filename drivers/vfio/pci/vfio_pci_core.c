@@ -1179,7 +1179,13 @@ static int vfio_pci_ioctl_get_info(struct vfio_pci_core_device *vdev,
 		return ret;
 	}
 
+	ret = vfio_pci_core_access_begin(vdev);
+	if (ret) {
+		kfree(caps.buf);
+		return ret;
+	}
 	ret = vfio_pci_info_atomic_cap(vdev, &caps);
+	vfio_pci_core_access_end(vdev);
 	if (ret && ret != -ENODEV) {
 		pci_warn(vdev->pdev,
 			 "Failed to setup AtomicOps info capability\n");
