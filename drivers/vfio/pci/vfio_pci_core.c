@@ -372,15 +372,21 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 				     struct eventfd_ctx *efdctx)
 {
+	int ret;
+
 	/*
 	 * The vdev power related flags are protected with 'memory_lock'
 	 * semaphore.
 	 */
+	ret = vfio_pci_core_access_begin(vdev);
+	if (ret)
+		return ret;
 	vfio_pci_zap_and_down_write_memory_lock(vdev);
 	vfio_pci_dma_buf_move(vdev, true);
 
 	if (vdev->pm_runtime_engaged) {
 		up_write(&vdev->memory_lock);
+		vfio_pci_core_access_end(vdev);
 		return -EINVAL;
 	}
 
@@ -388,6 +394,7 @@ static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 	vdev->pm_wake_eventfd_ctx = efdctx;
 	pm_runtime_put_noidle(&vdev->pdev->dev);
 	up_write(&vdev->memory_lock);
+	vfio_pci_core_access_end(vdev);
 
 	return 0;
 }
@@ -483,7 +490,11 @@ static int vfio_pci_core_pm_exit(struct vfio_pci_core_device *vdev, u32 flags,
 	 * already signaled the eventfd and exited low power mode itself.
 	 * pm_runtime_engaged protects the redundant call here.
 	 */
+	ret = vfio_pci_core_access_begin(vdev);
+	if (ret)
+		return ret;
 	vfio_pci_runtime_pm_exit(vdev);
+	vfio_pci_core_access_end(vdev);
 	return 0;
 }
 
@@ -1867,6 +1878,24 @@ static ssize_t vfio_pci_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 	if (index >= VFIO_PCI_NUM_REGIONS + vdev->num_regions)
 		return -EINVAL;
 
+	ret = vfio_pci_core_access_begin(vdev);
+	if (ret)
+		return ret;
+	vfio_pci_core_access_end(vdev);
+
+	/*
+	 * Resume with the guard dropped. A resume takes pci_bus_sem, through
+	 * pcie_aspm_pm_state_change() and, from D3cold, through
+	 * pci_bridge_wait_for_secondary_bus(). The error callbacks take
+	 * recovery_lock from under pci_bus_sem, so holding it here would
+	 * invert the order.
+	 *
+	 * The check above only avoids waking a device whose access is already
+	 * blocked. A recovery which starts in between is not excluded, and
+	 * does not need to be. pcie_do_recovery() has already resumed every
+	 * device under the bridge and holds the reference until it finishes.
+	 * The region access below takes the guard for itself.
+	 */
 	ret = pm_runtime_resume_and_get(&vdev->pdev->dev);
 	if (ret) {
 		pci_info_ratelimited(vdev->pdev, "runtime resume failed %d\n",
