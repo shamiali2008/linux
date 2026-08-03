@@ -2828,6 +2828,73 @@ static pci_ers_result_t vfio_pci_core_aer_slot_reset(struct pci_dev *pdev)
 	return result;
 }
 
+static void vfio_pci_core_aer_resume(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+	unsigned long irq_flags;
+	u32 flags;
+	int ret = 0;
+
+	down_write(&vdev->recovery_lock);
+
+	/*
+	 * Pay any deferred ROM disable before the in-progress check below,
+	 * which a failed transaction has already cleared, or it would be
+	 * lost.
+	 */
+	vfio_pci_recovery_rom_disable(vdev);
+
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS))
+		goto out_unlock;
+
+	if (!vdev->pci_recovery_device_open) {
+		vdev->pci_recovery_command_valid = false;
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   vdev->pci_recovery_flags &
+			   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+		goto out_unlock;
+	}
+
+	down_write(&vdev->memory_lock);
+	/*
+	 * Restore the command word and clear access_blocked under irqlock.
+	 * The INTx handler writes the same register through
+	 * pci_check_and_mask_intx(), so it must not interleave with the
+	 * restore, and it must not see access blocked cleared while the
+	 * temporary command value is still installed.
+	 *
+	 * INTX_DISABLE comes from the INTx state rather than from the saved
+	 * word, which can be older than the last mask. The replay below is
+	 * what unmasks the line.
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_RESET) &&
+	    vdev->pci_recovery_command_valid) {
+		u16 cmd = vdev->pci_recovery_command;
+
+		cmd = vfio_pci_intx_recovery_command(vdev, cmd);
+		ret = pci_write_config_word(pdev, PCI_COMMAND, cmd);
+	}
+	if (!ret)
+		WRITE_ONCE(vdev->pci_recovery_access_blocked, false);
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+	if (!ret && __vfio_pci_memory_enabled(vdev))
+		vfio_pci_dma_buf_move(vdev, false);
+	up_write(&vdev->memory_lock);
+
+	vdev->pci_recovery_command_valid = false;
+	flags = vdev->pci_recovery_flags & ~VFIO_PCI_RECOVERY_IN_PROGRESS;
+	if (ret)
+		flags |= VFIO_PCI_RECOVERY_FAILED;
+	WRITE_ONCE(vdev->pci_recovery_flags, flags);
+	if (!ret)
+		vfio_pci_intx_recovery_finish(vdev);
+
+out_unlock:
+	up_write(&vdev->recovery_lock);
+	wake_up_all(&vdev->pci_recovery_wait);
+}
+
 int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
 				  int nr_virtfn)
 {
@@ -2901,6 +2968,7 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 const struct pci_error_handlers vfio_pci_core_err_handlers = {
 	.error_detected = vfio_pci_core_aer_err_detected,
 	.slot_reset = vfio_pci_core_aer_slot_reset,
+	.resume = vfio_pci_core_aer_resume,
 };
 EXPORT_SYMBOL_GPL(vfio_pci_core_err_handlers);
 
