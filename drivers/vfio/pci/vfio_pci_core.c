@@ -1313,11 +1313,29 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_ioctl_get_region_info);
 
+/*
+ * Which IRQ indexes can reach the device. ERR and REQ are software only.
+ * An index added later gets no access guard until it is listed here.
+ */
+static bool vfio_pci_irq_index_is_device(u32 index)
+{
+	switch (index) {
+	case VFIO_PCI_INTX_IRQ_INDEX:
+	case VFIO_PCI_MSI_IRQ_INDEX:
+	case VFIO_PCI_MSIX_IRQ_INDEX:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int vfio_pci_ioctl_get_irq_info(struct vfio_pci_core_device *vdev,
 				       struct vfio_irq_info __user *arg)
 {
 	unsigned long minsz = offsetofend(struct vfio_irq_info, count);
 	struct vfio_irq_info info;
+	bool device_irq;
+	int ret;
 
 	if (copy_from_user(&info, arg, minsz))
 		return -EFAULT;
@@ -1336,7 +1354,15 @@ static int vfio_pci_ioctl_get_irq_info(struct vfio_pci_core_device *vdev,
 
 	info.flags = VFIO_IRQ_INFO_EVENTFD;
 
+	device_irq = vfio_pci_irq_index_is_device(info.index);
+	if (device_irq) {
+		ret = vfio_pci_core_access_begin(vdev);
+		if (ret)
+			return ret;
+	}
 	info.count = vfio_pci_get_irq_count(vdev, info.index);
+	if (device_irq)
+		vfio_pci_core_access_end(vdev);
 
 	if (info.index == VFIO_PCI_INTX_IRQ_INDEX)
 		info.flags |=
@@ -1353,13 +1379,23 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 	unsigned long minsz = offsetofend(struct vfio_irq_set, count);
 	struct vfio_irq_set hdr;
 	u8 *data = NULL;
+	bool device_irq;
 	int max, ret = 0;
 	size_t data_size = 0;
 
 	if (copy_from_user(&hdr, arg, minsz))
 		return -EFAULT;
 
+	device_irq = vfio_pci_irq_index_is_device(hdr.index);
+	if (device_irq) {
+		ret = vfio_pci_core_access_begin(vdev);
+		if (ret)
+			return ret;
+	}
 	max = vfio_pci_get_irq_count(vdev, hdr.index);
+	/* Dropped for the user copy below, which can fault under userfaultfd. */
+	if (device_irq)
+		vfio_pci_core_access_end(vdev);
 
 	ret = vfio_set_irqs_validate_and_prepare(&hdr, max, VFIO_PCI_NUM_IRQS,
 						 &data_size);
@@ -1372,12 +1408,31 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 			return PTR_ERR(data);
 	}
 
+	/*
+	 * Interrupt teardown reaches vfio_virqfd_disable(), which flushes the
+	 * global virqfd cleanup workqueue, so recovery_lock is held here for
+	 * as long as work queued by any vfio device takes. Shutdown work waits
+	 * for its inject worker, and an ioeventfd inject takes that device's
+	 * memory_lock, so the wait can last as long as a reset there. That is
+	 * only a wait. Nothing on that workqueue takes recovery_lock, which is
+	 * why the ioeventfd write path reads the recovery state without it. A
+	 * callback there which used the vfio_pci_core_iowrite*() accessors
+	 * would break that and deadlock against a queued writer.
+	 */
+	if (device_irq) {
+		ret = vfio_pci_core_access_begin(vdev);
+		if (ret)
+			goto out_free;
+	}
 	mutex_lock(&vdev->igate);
 
 	ret = vfio_pci_set_irqs_ioctl(vdev, hdr.flags, hdr.index, hdr.start,
 				      hdr.count, data);
 
 	mutex_unlock(&vdev->igate);
+	if (device_irq)
+		vfio_pci_core_access_end(vdev);
+out_free:
 	kfree(data);
 
 	return ret;
