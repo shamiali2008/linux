@@ -1379,14 +1379,53 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 	return ret;
 }
 
-static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
-				void __user *arg)
+int vfio_pci_try_reset_function(struct vfio_pci_core_device *vdev,
+				bool reset_power_state)
 {
+	struct pci_dev *pdev = vdev->pdev;
+	bool enabled = false;
+	bool supported = vdev->pci_recovery_supported;
 	int ret;
 
-	if (!vdev->reset_works)
-		return -EINVAL;
+	/*
+	 * Claim the device against recovery before resetting it. The PCI
+	 * error callbacks hold recovery_lock for their whole body, so taking
+	 * it for writing here waits for one already running, and
+	 * access_blocked keeps a later one away while the lock is dropped.
+	 */
+	if (supported) {
+		down_write(&vdev->recovery_lock);
+		if (!vdev->pci_recovery_device_open) {
+			ret = -ENODEV;
+			goto out_recovery;
+		}
 
+		enabled = vdev->pci_recovery_enabled;
+
+		/*
+		 * Only claim access_blocked when recovery is enabled.
+		 * error_detected() returns early for a device which has not
+		 * enabled it, so there is nothing to exclude, and claiming it
+		 * anyway would fail the second of two concurrent
+		 * VFIO_DEVICE_RESET calls with -EBUSY.
+		 */
+		if (enabled) {
+			if (vdev->pci_recovery_access_blocked) {
+				ret = -EBUSY;
+				goto out_recovery;
+			}
+			WRITE_ONCE(vdev->pci_recovery_access_blocked, true);
+		}
+		up_write(&vdev->recovery_lock);
+	}
+
+	/*
+	 * On a device which supports recovery, taking recovery_lock for
+	 * writing above waited for anything already past its access check,
+	 * and if recovery is enabled access_blocked keeps new ones out. Do
+	 * not hold recovery_lock while taking memory_lock or running a reset
+	 * method, since a reset can take pci_bus_sem.
+	 */
 	vfio_pci_zap_and_down_write_memory_lock(vdev);
 
 	/*
@@ -1398,15 +1437,49 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 	 * reset without restoring the original state (saved locally in
 	 * 'vdev->pm_save').
 	 */
-	vfio_pci_set_power_state(vdev, PCI_D0);
+	if (reset_power_state)
+		vfio_pci_set_power_state(vdev, PCI_D0);
 
 	vfio_pci_dma_buf_move(vdev, true);
-	ret = pci_try_reset_function(vdev->pdev);
+	ret = pci_try_reset_function(pdev);
 	if (__vfio_pci_memory_enabled(vdev))
 		vfio_pci_dma_buf_move(vdev, false);
 	up_write(&vdev->memory_lock);
 
+	if (enabled) {
+		down_write(&vdev->recovery_lock);
+		/*
+		 * An error callback can have started an event while the lock
+		 * was down. Leave the state to it. Only unblock access for a
+		 * reset which is still the one holding it.
+		 */
+		if (vdev->pci_recovery_device_open &&
+		    !(vdev->pci_recovery_flags & (VFIO_PCI_RECOVERY_IN_PROGRESS |
+						  VFIO_PCI_RECOVERY_FAILED)))
+			WRITE_ONCE(vdev->pci_recovery_access_blocked, false);
+		up_write(&vdev->recovery_lock);
+		/*
+		 * Access is blocked for the length of the reset, so anything
+		 * waiting for it to clear has to be woken here. A later patch
+		 * adds the BAR fault path which waits on this.
+		 */
+		wake_up_all(&vdev->pci_recovery_wait);
+	}
+
 	return ret;
+
+out_recovery:
+	up_write(&vdev->recovery_lock);
+	return ret;
+}
+
+static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
+				void __user *arg)
+{
+	if (!vdev->reset_works)
+		return -EINVAL;
+
+	return vfio_pci_try_reset_function(vdev, true);
 }
 
 static int vfio_pci_ioctl_get_pci_hot_reset_info(
