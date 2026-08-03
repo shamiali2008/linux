@@ -1747,6 +1747,27 @@ static ssize_t vfio_pci_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 	return ret;
 }
 
+int vfio_pci_core_access_begin(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->pci_recovery_supported)
+		return 0;
+
+	down_read(&vdev->recovery_lock);
+	if (unlikely(!vdev->pci_recovery_device_open ||
+		     vdev->pci_recovery_access_blocked)) {
+		up_read(&vdev->recovery_lock);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+void vfio_pci_core_access_end(struct vfio_pci_core_device *vdev)
+{
+	if (vdev->pci_recovery_supported)
+		up_read(&vdev->recovery_lock);
+}
+
 ssize_t vfio_pci_core_read(struct vfio_device *core_vdev, char __user *buf,
 		size_t count, loff_t *ppos)
 {
