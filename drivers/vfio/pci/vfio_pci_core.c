@@ -2938,6 +2938,27 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 		}
 
 		/*
+		 * Between the AER callbacks memory_lock is not held, so refuse
+		 * the reset on access_blocked as well. Read it rather than
+		 * take recovery_lock, which would have to be released before
+		 * pci_reset_bus() anyway since that reaches pci_bus_sem.
+		 *
+		 * Let a device which has failed for good through. Nothing is
+		 * running on its behalf, and this reset covers the whole set,
+		 * so refusing there would stop a healthy sibling from being
+		 * reset because an unrelated device errored. The failed one
+		 * stays blocked, since the reset does not unblock a device
+		 * with FAILED set.
+		 */
+		if (vdev->pci_recovery_supported &&
+		    READ_ONCE(vdev->pci_recovery_access_blocked) &&
+		    !(READ_ONCE(vdev->pci_recovery_flags) &
+		      VFIO_PCI_RECOVERY_FAILED)) {
+			ret = -EBUSY;
+			break;
+		}
+
+		/*
 		 * Take the memory write lock for each device and zap BAR
 		 * mappings to prevent the user accessing the device while in
 		 * reset.  Locking multiple devices is prone to deadlock,
