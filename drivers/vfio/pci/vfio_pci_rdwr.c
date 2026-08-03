@@ -349,56 +349,85 @@ ssize_t vfio_pci_vga_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 }
 #endif
 
-static void vfio_pci_ioeventfd_do_write(struct vfio_pci_ioeventfd *ioeventfd,
-					bool test_mem)
+static int vfio_pci_ioeventfd_do_write(struct vfio_pci_ioeventfd *ioeventfd,
+				       bool trylock)
 {
+	struct vfio_pci_core_device *vdev = ioeventfd->vdev;
+
+	if (ioeventfd->test_mem) {
+		if (trylock) {
+			if (!down_read_trylock(&vdev->memory_lock))
+				return 1; /* Lock contended, use thread */
+		} else {
+			down_read(&vdev->memory_lock);
+		}
+	}
+
+	/*
+	 * Read the recovery state lock-free rather than under recovery_lock.
+	 * This path runs from the virqfd cleanup workqueue, which is flushed
+	 * from paths that take recovery_lock for reading, so blocking on it
+	 * here would deadlock behind a queued writer.
+	 *
+	 * For a memory BAR, a blocked device still waits for a write already
+	 * under way, through memory_lock. The lock is taken above before the
+	 * flag is read, so a write which saw the flag clear is already
+	 * holding the read side, and the blocker waits for it when it takes
+	 * memory_lock for writing. An I/O port BAR takes no memory_lock, so
+	 * a write which saw the flag clear can still land afterwards. Port
+	 * writes are best effort here.
+	 *
+	 * A write can also be dropped for a short while after a reset has
+	 * finished, since VFIO_DEVICE_RESET releases memory_lock before it
+	 * retakes recovery_lock to unblock access. Closing that would mean
+	 * taking recovery_lock inside memory_lock, which is the wrong way
+	 * round.
+	 *
+	 * pci_recovery_device_open records that the recovery machinery is
+	 * live, so it is only ever set for drivers which advertise support.
+	 * Testing it unconditionally would drop every write for every other
+	 * driver.
+	 *
+	 * The raw vfio_iowrite*() accessors below are used for the same
+	 * reason. This path must not take recovery_lock.
+	 */
+	if (vdev->pci_recovery_supported &&
+	    (!READ_ONCE(vdev->pci_recovery_device_open) ||
+	     READ_ONCE(vdev->pci_recovery_access_blocked)))
+		goto out_memory;
+
+	if (ioeventfd->test_mem && !__vfio_pci_memory_enabled(vdev))
+		goto out_memory;
+
 	switch (ioeventfd->count) {
 	case 1:
-		vfio_pci_core_iowrite8(ioeventfd->vdev, test_mem,
-				       ioeventfd->data, ioeventfd->addr);
+		vfio_iowrite8(ioeventfd->data, ioeventfd->addr);
 		break;
 	case 2:
-		vfio_pci_core_iowrite16(ioeventfd->vdev, test_mem,
-					ioeventfd->data, ioeventfd->addr);
+		vfio_iowrite16(ioeventfd->data, ioeventfd->addr);
 		break;
 	case 4:
-		vfio_pci_core_iowrite32(ioeventfd->vdev, test_mem,
-					ioeventfd->data, ioeventfd->addr);
+		vfio_iowrite32(ioeventfd->data, ioeventfd->addr);
 		break;
 	case 8:
-		vfio_pci_core_iowrite64(ioeventfd->vdev, test_mem,
-					ioeventfd->data, ioeventfd->addr);
+		vfio_iowrite64(ioeventfd->data, ioeventfd->addr);
 		break;
 	}
+
+out_memory:
+	if (ioeventfd->test_mem)
+		up_read(&vdev->memory_lock);
+	return 0;
 }
 
 static int vfio_pci_ioeventfd_handler(void *opaque, void *unused)
 {
-	struct vfio_pci_ioeventfd *ioeventfd = opaque;
-	struct vfio_pci_core_device *vdev = ioeventfd->vdev;
-
-	if (ioeventfd->test_mem) {
-		if (!down_read_trylock(&vdev->memory_lock))
-			return 1; /* Lock contended, use thread */
-		if (!__vfio_pci_memory_enabled(vdev)) {
-			up_read(&vdev->memory_lock);
-			return 0;
-		}
-	}
-
-	vfio_pci_ioeventfd_do_write(ioeventfd, false);
-
-	if (ioeventfd->test_mem)
-		up_read(&vdev->memory_lock);
-
-	return 0;
+	return vfio_pci_ioeventfd_do_write(opaque, true);
 }
 
 static void vfio_pci_ioeventfd_thread(void *opaque, void *unused)
 {
-	struct vfio_pci_ioeventfd *ioeventfd = opaque;
-
-	vfio_pci_ioeventfd_do_write(ioeventfd, ioeventfd->test_mem);
+	vfio_pci_ioeventfd_do_write(opaque, false);
 }
 
 int vfio_pci_ioeventfd(struct vfio_pci_core_device *vdev, loff_t offset,
