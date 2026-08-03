@@ -243,12 +243,8 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	if (!get_dma_buf.nr_ranges || get_dma_buf.flags)
 		return -EINVAL;
 
-	/*
-	 * For PCI the region_index is the BAR number like everything
-	 * else.  Check that PCI resources have been claimed for it.
-	 */
-	if (get_dma_buf.region_index >= VFIO_PCI_ROM_REGION_INDEX ||
-	    IS_ERR(vfio_pci_core_get_iomap(vdev, get_dma_buf.region_index)))
+	/* For PCI the region_index is the BAR number like everything else. */
+	if (get_dma_buf.region_index >= VFIO_PCI_ROM_REGION_INDEX)
 		return -ENODEV;
 
 	dma_ranges = memdup_array_user(&arg->dma_ranges, get_dma_buf.nr_ranges,
@@ -274,19 +270,30 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	priv->vdev = vdev;
 	priv->nr_ranges = get_dma_buf.nr_ranges;
 	priv->size = length;
+
+	ret = vfio_pci_core_access_begin(vdev);
+	if (ret)
+		goto err_free_phys;
+
+	/* Check that PCI resources have been claimed for the BAR. */
+	if (IS_ERR(vfio_pci_core_get_iomap(vdev, get_dma_buf.region_index))) {
+		ret = -ENODEV;
+		goto err_access;
+	}
+
 	ret = vdev->pci_ops->get_dmabuf_phys(vdev, &priv->provider,
 					     get_dma_buf.region_index,
 					     priv->phys_vec, dma_ranges,
 					     priv->nr_ranges);
 	if (ret)
-		goto err_free_phys;
+		goto err_access;
 
 	kfree(dma_ranges);
 	dma_ranges = NULL;
 
 	if (!vfio_device_try_get_registration(&vdev->vdev)) {
 		ret = -ENODEV;
-		goto err_free_phys;
+		goto err_access;
 	}
 
 	exp_info.ops = &vfio_pci_dmabuf_ops;
@@ -311,6 +318,7 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	list_add_tail(&priv->dmabufs_elm, &vdev->dmabufs);
 	dma_resv_unlock(priv->dmabuf->resv);
 	up_write(&vdev->memory_lock);
+	vfio_pci_core_access_end(vdev);
 
 	/*
 	 * dma_buf_fd() consumes the reference, when the file closes the dmabuf
@@ -324,6 +332,8 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 
 err_dev_put:
 	vfio_device_put_registration(&vdev->vdev);
+err_access:
+	vfio_pci_core_access_end(vdev);
 err_free_phys:
 	kfree(priv->phys_vec);
 err_free_priv:
