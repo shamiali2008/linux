@@ -99,6 +99,12 @@ static const u16 pci_ext_cap_length[PCI_EXT_CAP_ID_MAX + 1] = {
 	[PCI_EXT_CAP_ID_DVSEC]	=	0xFF,
 };
 
+/* What a config write asked for which has to wait for the access guard. */
+struct vfio_pci_config_deferred {
+	bool	flr;		/* a function-level reset */
+	bool	power_up;	/* a transition to D0 */
+};
+
 /*
  * Read/Write Permission Bits - one bit for each bit in capability
  * Any field can be read if it exists, but what is read depends on
@@ -111,8 +117,17 @@ struct perm_bits {
 	u8	*write;		/* writeable bits */
 	int	(*readfn)(struct vfio_pci_core_device *vdev, int pos, int count,
 			  struct perm_bits *perm, int offset, __le32 *val);
+	/*
+	 * @deferred records work the write asked for which a writefn must not
+	 * do itself. Both a reset method and a transition to D0 acquire
+	 * pci_bus_sem, which AER already holds when it enters the driver, so
+	 * doing either here would invert the lock order against recovery_lock.
+	 * The dispatcher does them after dropping recovery_lock. Callers zero
+	 * it, and a writefn only sets a field on a success return.
+	 */
 	int	(*writefn)(struct vfio_pci_core_device *vdev, int pos, int count,
-			   struct perm_bits *perm, int offset, __le32 val);
+			   struct perm_bits *perm, int offset, __le32 val,
+			   struct vfio_pci_config_deferred *deferred);
 };
 
 #define	NO_VIRT		0
@@ -200,7 +215,8 @@ static int vfio_default_config_read(struct vfio_pci_core_device *vdev, int pos,
 
 static int vfio_default_config_write(struct vfio_pci_core_device *vdev, int pos,
 				     int count, struct perm_bits *perm,
-				     int offset, __le32 val)
+				     int offset, __le32 val,
+				     struct vfio_pci_config_deferred *deferred)
 {
 	__le32 virt = 0, write = 0;
 
@@ -272,7 +288,8 @@ static int vfio_direct_config_read(struct vfio_pci_core_device *vdev, int pos,
 /* Raw access skips any kind of virtualization */
 static int vfio_raw_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 struct vfio_pci_config_deferred *deferred)
 {
 	int ret;
 
@@ -299,7 +316,8 @@ static int vfio_raw_config_read(struct vfio_pci_core_device *vdev, int pos,
 /* Virt access uses only virtualization */
 static int vfio_virt_config_write(struct vfio_pci_core_device *vdev, int pos,
 				  int count, struct perm_bits *perm,
-				  int offset, __le32 val)
+				  int offset, __le32 val,
+				  struct vfio_pci_config_deferred *deferred)
 {
 	memcpy(vdev->vconfig + pos, &val, count);
 	return count;
@@ -563,7 +581,8 @@ static bool vfio_need_bar_restore(struct vfio_pci_core_device *vdev)
 
 static int vfio_basic_config_write(struct vfio_pci_core_device *vdev, int pos,
 				   int count, struct perm_bits *perm,
-				   int offset, __le32 val)
+				   int offset, __le32 val,
+				   struct vfio_pci_config_deferred *deferred)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	__le16 *virt_cmd;
@@ -613,7 +632,8 @@ static int vfio_basic_config_write(struct vfio_pci_core_device *vdev, int pos,
 			vfio_bar_restore(vdev);
 	}
 
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  deferred);
 	if (count < 0) {
 		if (offset == PCI_COMMAND)
 			up_write(&vdev->memory_lock);
@@ -727,9 +747,11 @@ static void vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
 
 static int vfio_pm_config_write(struct vfio_pci_core_device *vdev, int pos,
 				int count, struct perm_bits *perm,
-				int offset, __le32 val)
+				int offset, __le32 val,
+				struct vfio_pci_config_deferred *deferred)
 {
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  deferred);
 	if (count < 0)
 		return count;
 
@@ -738,8 +760,15 @@ static int vfio_pm_config_write(struct vfio_pci_core_device *vdev, int pos,
 
 		switch (le32_to_cpu(val) & PCI_PM_CTRL_STATE_MASK) {
 		case 0:
-			state = PCI_D0;
-			break;
+			/*
+			 * Going to D0 reaches pci_set_full_power_state(),
+			 * which takes pci_bus_sem through
+			 * pcie_aspm_pm_state_change(). Leave it to the
+			 * dispatcher. The lower states do not, so they run
+			 * here.
+			 */
+			deferred->power_up = true;
+			return count;
 		case 1:
 			state = PCI_D1;
 			break;
@@ -799,7 +828,8 @@ static int __init init_pci_cap_pm_perm(struct perm_bits *perm)
 
 static int vfio_vpd_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 struct vfio_pci_config_deferred *deferred)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	__le16 *paddr = (__le16 *)(vdev->vconfig + pos - offset + PCI_VPD_ADDR);
@@ -812,7 +842,8 @@ static int vfio_vpd_config_write(struct vfio_pci_core_device *vdev, int pos,
 	 * of PCI_VPD_ADDR, then the PCI_VPD_ADDR_F bit is written and we
 	 * have work to do.
 	 */
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  deferred);
 	if (count < 0 || offset > PCI_VPD_ADDR + 1 ||
 	    offset + count <= PCI_VPD_ADDR + 1)
 		return count;
@@ -881,21 +912,24 @@ static int __init init_pci_cap_pcix_perm(struct perm_bits *perm)
 
 static int vfio_exp_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 struct vfio_pci_config_deferred *deferred)
 {
 	__le16 *ctrl = (__le16 *)(vdev->vconfig + pos -
 				  offset + PCI_EXP_DEVCTL);
 	int readrq = le16_to_cpu(*ctrl) & PCI_EXP_DEVCTL_READRQ;
 
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  deferred);
 	if (count < 0)
 		return count;
 
 	/*
 	 * The FLR bit is virtualized, if set and the device supports PCIe
-	 * FLR, issue a reset_function.  Regardless, clear the bit, the spec
-	 * requires it to be always read as zero.  NB, reset_function might
-	 * not use a PCIe FLR, we don't have that level of granularity.
+	 * FLR, request a function reset once recovery_lock has been
+	 * released. Regardless, clear the bit, the spec requires it to be
+	 * always read as zero. NB, reset_function might not use a PCIe FLR,
+	 * we don't have that level of granularity.
 	 */
 	if (*ctrl & cpu_to_le16(PCI_EXP_DEVCTL_BCR_FLR)) {
 		u32 cap;
@@ -907,14 +941,8 @@ static int vfio_exp_config_write(struct vfio_pci_core_device *vdev, int pos,
 						 pos - offset + PCI_EXP_DEVCAP,
 						 &cap);
 
-		if (!ret && (cap & PCI_EXP_DEVCAP_FLR)) {
-			vfio_pci_zap_and_down_write_memory_lock(vdev);
-			vfio_pci_dma_buf_move(vdev, true);
-			pci_try_reset_function(vdev->pdev);
-			if (__vfio_pci_memory_enabled(vdev))
-				vfio_pci_dma_buf_move(vdev, false);
-			up_write(&vdev->memory_lock);
-		}
+		if (!ret && (cap & PCI_EXP_DEVCAP_FLR))
+			deferred->flr = true;
 	}
 
 	/*
@@ -968,19 +996,22 @@ static int __init init_pci_cap_exp_perm(struct perm_bits *perm)
 
 static int vfio_af_config_write(struct vfio_pci_core_device *vdev, int pos,
 				int count, struct perm_bits *perm,
-				int offset, __le32 val)
+				int offset, __le32 val,
+				struct vfio_pci_config_deferred *deferred)
 {
 	u8 *ctrl = vdev->vconfig + pos - offset + PCI_AF_CTRL;
 
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  deferred);
 	if (count < 0)
 		return count;
 
 	/*
 	 * The FLR bit is virtualized, if set and the device supports AF
-	 * FLR, issue a reset_function.  Regardless, clear the bit, the spec
-	 * requires it to be always read as zero.  NB, reset_function might
-	 * not use an AF FLR, we don't have that level of granularity.
+	 * FLR, request a function reset once recovery_lock has been
+	 * released. Regardless, clear the bit, the spec requires it to be
+	 * always read as zero. NB, reset_function might not use an AF FLR,
+	 * we don't have that level of granularity.
 	 */
 	if (*ctrl & PCI_AF_CTRL_FLR) {
 		u8 cap;
@@ -992,14 +1023,8 @@ static int vfio_af_config_write(struct vfio_pci_core_device *vdev, int pos,
 						pos - offset + PCI_AF_CAP,
 						&cap);
 
-		if (!ret && (cap & PCI_AF_CAP_FLR) && (cap & PCI_AF_CAP_TP)) {
-			vfio_pci_zap_and_down_write_memory_lock(vdev);
-			vfio_pci_dma_buf_move(vdev, true);
-			pci_try_reset_function(vdev->pdev);
-			if (__vfio_pci_memory_enabled(vdev))
-				vfio_pci_dma_buf_move(vdev, false);
-			up_write(&vdev->memory_lock);
-		}
+		if (!ret && (cap & PCI_AF_CAP_FLR) && (cap & PCI_AF_CAP_TP))
+			deferred->flr = true;
 	}
 
 	return count;
@@ -1168,9 +1193,11 @@ static int vfio_msi_config_read(struct vfio_pci_core_device *vdev, int pos,
 
 static int vfio_msi_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 struct vfio_pci_config_deferred *deferred)
 {
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  deferred);
 	if (count < 0)
 		return count;
 
@@ -1889,6 +1916,8 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 	struct perm_bits *perm;
 	__le32 val = 0;
 	int cap_start = 0, offset;
+	int access_ret;
+	struct vfio_pci_config_deferred deferred = {};
 	u8 cap_id;
 	ssize_t ret;
 
@@ -1957,14 +1986,42 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 		if (copy_from_user(&val, buf, count))
 			return -EFAULT;
 
-		ret = perm->writefn(vdev, *ppos, count, perm, offset, val);
+		access_ret = vfio_pci_core_access_begin(vdev);
+		if (access_ret)
+			return access_ret;
+		ret = perm->writefn(vdev, *ppos, count, perm, offset, val,
+				    &deferred);
+		vfio_pci_core_access_end(vdev);
+		if (ret < 0)
+			return ret;
+		/*
+		 * Both of these take pci_bus_sem, so run them with the access
+		 * guard dropped. The reset re-checks the recovery state for
+		 * itself. The power up does not, so check it here.
+		 *
+		 * Both are best effort, as the guest-requested FLR has always
+		 * been. The result is not reported back through the config
+		 * write. Without recovery enabled the only failure is -EAGAIN
+		 * from device lock contention, exactly as before. With it they
+		 * are dropped while a recovery or reset transaction is in
+		 * flight, which leaves the device in D0 and reset anyway.
+		 */
+		if (deferred.power_up &&
+		    !(vdev->pci_recovery_supported &&
+		      READ_ONCE(vdev->pci_recovery_access_blocked)))
+			vfio_lock_and_set_power_state(vdev, PCI_D0);
+		if (deferred.flr)
+			vfio_pci_try_reset_function(vdev, false);
 	} else {
-		if (perm->readfn) {
+		access_ret = vfio_pci_core_access_begin(vdev);
+		if (access_ret)
+			return access_ret;
+		if (perm->readfn)
 			ret = perm->readfn(vdev, *ppos, count,
 					   perm, offset, &val);
-			if (ret < 0)
-				return ret;
-		}
+		vfio_pci_core_access_end(vdev);
+		if (ret < 0)
+			return ret;
 
 		if (copy_to_user(buf, &val, count))
 			return -EFAULT;
