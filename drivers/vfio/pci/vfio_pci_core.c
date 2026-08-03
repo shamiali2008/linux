@@ -2756,6 +2756,77 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_err_detected);
 
+static pci_ers_result_t vfio_pci_core_aer_slot_reset(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+	pci_ers_result_t result = PCI_ERS_RESULT_RECOVERED;
+	int ret = 0;
+
+	down_write(&vdev->recovery_lock);
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS) ||
+	    !vdev->pci_recovery_device_open) {
+		up_write(&vdev->recovery_lock);
+		return PCI_ERS_RESULT_NONE;
+	}
+
+	/*
+	 * Restore first. aer_root_reset() resets the link with
+	 * PCI_RESET_NO_RESTORE, so on entry the BARs read as zero. Tearing
+	 * down MSI-X before this would have pci_msix_shutdown() write through
+	 * the stale table mapping to an address the device no longer decodes.
+	 */
+	pci_restore_state(pdev);
+
+	/*
+	 * Hold recovery_lock across the interrupt teardown.
+	 * vfio_pci_core_disable() runs the same teardown on close without
+	 * taking igate, and running the per-vector teardown twice frees the
+	 * irq, the name and the eventfd context twice.
+	 * vfio_pci_core_prepare_close() takes recovery_lock for writing
+	 * before it, so holding it here keeps the two apart.
+	 */
+	mutex_lock(&vdev->igate);
+	if (vdev->irq_type < VFIO_PCI_NUM_IRQS)
+		ret = vfio_pci_set_irqs_ioctl(vdev,
+					      VFIO_IRQ_SET_DATA_NONE |
+					      VFIO_IRQ_SET_ACTION_TRIGGER,
+					      vdev->irq_type, 0, 0, NULL);
+	mutex_unlock(&vdev->igate);
+
+	if (ret) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   (vdev->pci_recovery_flags |
+			    VFIO_PCI_RECOVERY_FAILED) &
+			   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+		vdev->pci_recovery_command_valid = false;
+		/*
+		 * Vote NONE, not DISCONNECT. A DISCONNECT anywhere in the
+		 * domain makes the core skip resume() for every device under
+		 * the bridge and report permanent failure for all of them.
+		 * Our interrupt teardown failing says nothing about the
+		 * others, so record it locally and leave the domain verdict
+		 * alone.
+		 */
+		result = PCI_ERS_RESULT_NONE;
+	} else {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   vdev->pci_recovery_flags |
+			   VFIO_PCI_RECOVERY_RESET);
+	}
+
+	up_write(&vdev->recovery_lock);
+	/*
+	 * Whoever clears IN_PROGRESS owes the wake. resume() will not do it,
+	 * since it bails once IN_PROGRESS is clear, and the core skips it
+	 * altogether if the domain verdict is not RECOVERED. On success the
+	 * transaction carries on and resume() wakes.
+	 */
+	if (ret)
+		wake_up_all(&vdev->pci_recovery_wait);
+
+	return result;
+}
+
 int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
 				  int nr_virtfn)
 {
@@ -2828,6 +2899,7 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 
 const struct pci_error_handlers vfio_pci_core_err_handlers = {
 	.error_detected = vfio_pci_core_aer_err_detected,
+	.slot_reset = vfio_pci_core_aer_slot_reset,
 };
 EXPORT_SYMBOL_GPL(vfio_pci_core_err_handlers);
 
