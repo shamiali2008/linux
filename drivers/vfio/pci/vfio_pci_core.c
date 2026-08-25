@@ -1558,6 +1558,7 @@ int vfio_pci_try_reset_function(struct vfio_pci_core_device *vdev,
 						  VFIO_PCI_RECOVERY_FAILED))) {
 			vfio_pci_recovery_rom_disable(vdev);
 			WRITE_ONCE(vdev->pci_recovery_access_blocked, false);
+			vfio_pci_intx_recovery_finish(vdev);
 		}
 		up_write(&vdev->recovery_lock);
 		/*
