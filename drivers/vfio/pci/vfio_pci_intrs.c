@@ -29,6 +29,8 @@ struct vfio_pci_irq_ctx {
 	struct virqfd			*mask;
 	char				*name;
 	bool				masked;
+	bool				recovery_masked;
+	bool				unmask_pending;
 	struct irq_bypass_producer	producer;
 };
 
@@ -220,6 +222,40 @@ void vfio_pci_intx_unmask(struct vfio_pci_core_device *vdev)
 	mutex_unlock(&vdev->igate);
 }
 
+/*
+ * Mask INTx because recovery has blocked device access. Returns true if this
+ * call did the masking, which means recovery is the one which must unmask.
+ *
+ * Nothing is normally asserted when a recovery starts, and
+ * pci_check_and_mask_intx() only writes DisINTx when the status register says
+ * an interrupt is pending, so it would leave the line alone. pci_intx() masks
+ * whatever the device is doing, as __vfio_pci_intx_mask() already does for the
+ * same reason.
+ *
+ * Masking a pci_2_3 device goes through config space. If the error left
+ * config space unreadable the write has no effect and the line stays
+ * asserted, which is no worse than not trying. For a non-fatal error config
+ * space still works, and this is what keeps a shared line from storming while
+ * access is blocked.
+ */
+static bool vfio_pci_intx_mask_for_recovery(struct vfio_pci_core_device *vdev,
+					    struct vfio_pci_irq_ctx *ctx)
+{
+	lockdep_assert_held(&vdev->irqlock);
+
+	if (ctx->masked)
+		return false;
+
+	if (!vdev->pci_2_3)
+		disable_irq_nosync(vdev->pdev->irq);
+	else
+		pci_intx(vdev->pdev, 0);
+
+	ctx->masked = true;
+	ctx->recovery_masked = true;
+	return true;
+}
+
 static irqreturn_t vfio_intx_handler(int irq, void *dev_id)
 {
 	struct vfio_pci_irq_ctx *ctx = dev_id;
@@ -245,6 +281,86 @@ static irqreturn_t vfio_intx_handler(int irq, void *dev_id)
 		vfio_send_intx_eventfd(vdev, ctx);
 
 	return ret;
+}
+
+void vfio_pci_intx_recovery_start(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_irq_ctx *ctx;
+	unsigned long flags;
+
+	lockdep_assert_held_write(&vdev->recovery_lock);
+
+	spin_lock_irqsave(&vdev->irqlock, flags);
+	if (!is_intx(vdev))
+		goto out_unlock;
+
+	ctx = vfio_irq_ctx_get(vdev, 0);
+	if (WARN_ON_ONCE(!ctx))
+		goto out_unlock;
+
+	vfio_pci_intx_mask_for_recovery(vdev, ctx);
+
+out_unlock:
+	spin_unlock_irqrestore(&vdev->irqlock, flags);
+}
+
+/*
+ * Replay the masking recovery did, and any unmask which arrived while it was
+ * blocked. Call this only after access_blocked has been cleared, or the
+ * replayed unmask is swallowed and recorded as pending again with nothing
+ * left to replay it.
+ */
+/*
+ * The command word saved before the quiesce can have INTX_DISABLE clear, but
+ * the INTx handler may have masked the line since. Keep the bit as the INTx
+ * state has it, so hardware and ctx->masked agree until
+ * vfio_pci_intx_recovery_finish() replays. Restoring the saved bit instead
+ * would unmask a line the handler still believes is masked, and a shared
+ * pci_2_3 line would then storm until note_interrupt() disables it.
+ */
+u16 vfio_pci_intx_recovery_command(struct vfio_pci_core_device *vdev,
+				   u16 command)
+{
+	struct vfio_pci_irq_ctx *ctx;
+
+	lockdep_assert_held(&vdev->irqlock);
+
+	if (!is_intx(vdev))
+		return command;
+
+	ctx = vfio_irq_ctx_get(vdev, 0);
+	if (ctx && ctx->masked)
+		command |= PCI_COMMAND_INTX_DISABLE;
+
+	return command;
+}
+
+void vfio_pci_intx_recovery_finish(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_irq_ctx *ctx;
+	unsigned long flags;
+	bool replay = false;
+
+	lockdep_assert_held_write(&vdev->recovery_lock);
+
+	mutex_lock(&vdev->igate);
+	spin_lock_irqsave(&vdev->irqlock, flags);
+	if (!is_intx(vdev))
+		goto out_unlock;
+
+	ctx = vfio_irq_ctx_get(vdev, 0);
+	if (WARN_ON_ONCE(!ctx))
+		goto out_unlock;
+
+	replay = ctx->recovery_masked || ctx->unmask_pending;
+	ctx->recovery_masked = false;
+	ctx->unmask_pending = false;
+
+out_unlock:
+	spin_unlock_irqrestore(&vdev->irqlock, flags);
+	if (replay)
+		__vfio_pci_intx_unmask(vdev);
+	mutex_unlock(&vdev->igate);
 }
 
 static int vfio_intx_enable(struct vfio_pci_core_device *vdev,
