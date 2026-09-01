@@ -1996,6 +1996,12 @@ void arm_smmu_make_s2_domain_ste(struct arm_smmu_ste *target,
 		(master->stall_enabled ? STRTAB_STE_2_S2S : 0) |
 		STRTAB_STE_2_S2R);
 
+	/* S2HD requires S2HA, the PTEs carry the DBM bit for both */
+	if (smmu_domain->armv8pt.armpt.common.features &
+	    BIT(PT_FEAT_ARMV8_DBM))
+		target->data[2] |= cpu_to_le64(STRTAB_STE_2_S2HA |
+					       STRTAB_STE_2_S2HD);
+
 	target->data[3] = cpu_to_le64(info.ttb & STRTAB_STE_3_S2TTB_MASK);
 }
 EXPORT_SYMBOL_IF_KUNIT(arm_smmu_make_s2_domain_ste);
@@ -3216,14 +3222,16 @@ static int arm_smmu_domain_finalise(struct arm_smmu_domain *smmu_domain,
 		finalise_stage_fn = arm_smmu_domain_finalise_s1;
 		break;
 	case ARM_SMMU_DOMAIN_S2:
-		if (enable_dirty)
-			return -EOPNOTSUPP;
 		cfg.common.features |= BIT(PT_FEAT_ARMV8_S2);
 		cfg.common.hw_max_vasz_lg2 = smmu->oas;
 		cfg.common.hw_max_oasz_lg2 = smmu->oas;
 		if ((smmu->features & ARM_SMMU_FEAT_S2FWB) &&
 		    (flags & IOMMU_HWPT_ALLOC_NEST_PARENT))
 			cfg.common.features |= BIT(PT_FEAT_ARMV8_S2FWB);
+		if (enable_dirty) {
+			cfg.common.features |= BIT(PT_FEAT_ARMV8_DBM);
+			smmu_domain->domain.dirty_ops = &arm_smmu_dirty_ops;
+		}
 		finalise_stage_fn = arm_smmu_domain_finalise_s2;
 		break;
 	default:
@@ -4247,7 +4255,13 @@ arm_smmu_domain_alloc_paging_flags(struct device *dev, u32 flags,
 			smmu_domain->stage = ARM_SMMU_DOMAIN_S2;
 		break;
 	case IOMMU_HWPT_ALLOC_NEST_PARENT:
+	case IOMMU_HWPT_ALLOC_NEST_PARENT | IOMMU_HWPT_ALLOC_DIRTY_TRACKING:
 		if (!(smmu->features & ARM_SMMU_FEAT_NESTING)) {
+			ret = -EOPNOTSUPP;
+			goto err_free;
+		}
+		if ((flags & IOMMU_HWPT_ALLOC_DIRTY_TRACKING) &&
+		    !arm_smmu_dbm_capable(smmu)) {
 			ret = -EOPNOTSUPP;
 			goto err_free;
 		}
