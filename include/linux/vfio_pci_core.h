@@ -138,6 +138,8 @@ struct vfio_pci_core_device {
 	bool			sriov_active;
 	struct pci_saved_state	*pci_saved_state;
 	struct pci_saved_state	*pm_save;
+	/* Deferred D0 request, protected by memory_lock. */
+	bool			power_up_pending;
 	int			ioeventfds_nr;
 	struct vfio_pci_eventfd __rcu *err_trigger;
 	struct vfio_pci_eventfd __rcu *req_trigger;
