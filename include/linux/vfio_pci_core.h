@@ -13,6 +13,7 @@
 #include <linux/vfio.h>
 #include <linux/irqbypass.h>
 #include <linux/rcupdate.h>
+#include <linux/srcu.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
 #include <linux/notifier.h>
@@ -129,6 +130,7 @@ struct vfio_pci_core_device {
 	bool			disable_idle_d3:1;
 	bool			nointxmask:1;
 	bool			disable_vga:1;
+	bool			pci_recovery_supported:1;
 	/* Flags modified at runtime - dedicated storage unit */
 	bool			needs_reset;
 	bool			pm_intx_masked;
@@ -148,6 +150,23 @@ struct vfio_pci_core_device {
 	struct vfio_pci_core_device	*sriov_pf_core_dev;
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
+	/*
+	 * Device accesses take access_srcu and check device_open and
+	 * access_blocked. To block access, set access_blocked and wait for
+	 * existing readers with synchronize_srcu(). New accesses fail with
+	 * -EIO while blocked.
+	 *
+	 * Close clears access_blocked before device_open.
+	 *
+	 * INTx paths use irqlock instead of access_srcu to coordinate with
+	 * recovery. They read pci_recovery_enabled and access_blocked with
+	 * READ_ONCE(), since writers do not always hold irqlock.
+	 */
+	struct srcu_struct	access_srcu;
+	bool			access_blocked;
+	/* Set after open completes, cleared before close tears down state. */
+	bool			device_open;
+	struct mutex		access_lock;	/* gate flag writers */
 	struct list_head	dmabufs;
 };
 

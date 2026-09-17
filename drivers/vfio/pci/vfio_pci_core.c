@@ -662,10 +662,18 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 	if (!vfio_vga_disabled(vdev) && vfio_pci_is_vga(pdev))
 		vdev->has_vga = true;
 
+	if (vdev->pci_recovery_supported) {
+		ret = init_srcu_struct(&vdev->access_srcu);
+		if (ret)
+			goto out_free_config;
+	}
+
 	vfio_pci_core_map_bars(vdev);
 
 	return 0;
 
+out_free_config:
+	vfio_config_free(vdev);
 out_free_zdev:
 	vfio_pci_zdev_close_device(vdev);
 out_free_state:
@@ -812,6 +820,9 @@ out:
 	/* Put the pm-runtime usage counter acquired during enable */
 	if (!vdev->disable_idle_d3)
 		pm_runtime_put(&pdev->dev);
+
+	if (vdev->pci_recovery_supported)
+		cleanup_srcu_struct(&vdev->access_srcu);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_disable);
 
@@ -819,6 +830,13 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+
+	if (vdev->pci_recovery_supported) {
+		scoped_guard(mutex, &vdev->access_lock) {
+			WRITE_ONCE(vdev->access_blocked, false);
+			WRITE_ONCE(vdev->device_open, false);
+		}
+	}
 
 	if (vdev->sriov_pf_core_dev) {
 		mutex_lock(&vdev->sriov_pf_core_dev->vf_token->lock);
@@ -851,6 +869,12 @@ void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
 		mutex_lock(&vdev->sriov_pf_core_dev->vf_token->lock);
 		vdev->sriov_pf_core_dev->vf_token->users++;
 		mutex_unlock(&vdev->sriov_pf_core_dev->vf_token->lock);
+	}
+
+	if (vdev->pci_recovery_supported) {
+		guard(mutex)(&vdev->access_lock);
+		WRITE_ONCE(vdev->access_blocked, false);
+		WRITE_ONCE(vdev->device_open, true);
 	}
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_finish_enable);
@@ -1680,6 +1704,33 @@ static ssize_t vfio_pci_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 	return ret;
 }
 
+/*
+ * Return an SRCU index for access_end(), or -EIO if access is blocked
+ * or the device is closed. Do not wait for recovery.
+ */
+int vfio_pci_core_access_begin(struct vfio_pci_core_device *vdev)
+{
+	int idx;
+
+	if (!vdev->pci_recovery_supported)
+		return 0;
+
+	idx = srcu_read_lock(&vdev->access_srcu);
+	if (unlikely(!READ_ONCE(vdev->device_open) ||
+		     READ_ONCE(vdev->access_blocked))) {
+		srcu_read_unlock(&vdev->access_srcu, idx);
+		return -EIO;
+	}
+
+	return idx;
+}
+
+void vfio_pci_core_access_end(struct vfio_pci_core_device *vdev, int idx)
+{
+	if (vdev->pci_recovery_supported)
+		srcu_read_unlock(&vdev->access_srcu, idx);
+}
+
 ssize_t vfio_pci_core_read(struct vfio_device *core_vdev, char __user *buf,
 		size_t count, loff_t *ppos)
 {
@@ -2196,6 +2247,7 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 	if (ret && ret != -EOPNOTSUPP)
 		return ret;
 	INIT_LIST_HEAD(&vdev->dmabufs);
+	mutex_init(&vdev->access_lock);
 	init_rwsem(&vdev->memory_lock);
 	xa_init(&vdev->ctx);
 
@@ -2210,6 +2262,7 @@ void vfio_pci_core_release_dev(struct vfio_device *core_vdev)
 
 	mutex_destroy(&vdev->igate);
 	mutex_destroy(&vdev->ioeventfds_lock);
+	mutex_destroy(&vdev->access_lock);
 	kfree(vdev->region);
 	kfree(vdev->pm_save);
 }
