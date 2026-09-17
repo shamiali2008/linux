@@ -1112,7 +1112,7 @@ static int vfio_pci_ioctl_get_info(struct vfio_pci_core_device *vdev,
 	unsigned long minsz = offsetofend(struct vfio_device_info, num_irqs);
 	struct vfio_device_info info = {};
 	struct vfio_info_cap caps = { .buf = NULL, .size = 0 };
-	int ret;
+	int ret, idx;
 
 	if (copy_from_user(&info, arg, minsz))
 		return -EFAULT;
@@ -1137,7 +1137,13 @@ static int vfio_pci_ioctl_get_info(struct vfio_pci_core_device *vdev,
 		return ret;
 	}
 
+	idx = vfio_pci_core_access_begin(vdev);
+	if (idx < 0) {
+		kfree(caps.buf);
+		return idx;
+	}
 	ret = vfio_pci_info_atomic_cap(vdev, &caps);
+	vfio_pci_core_access_end(vdev, idx);
 	if (ret && ret != -ENODEV) {
 		pci_warn(vdev->pdev,
 			 "Failed to setup AtomicOps info capability\n");
@@ -1213,6 +1219,10 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 			 * Check ROM content is valid. Need to enable memory
 			 * decode for ROM access in pci_map_rom().
 			 */
+			int idx = vfio_pci_core_access_begin(vdev);
+
+			if (idx < 0)
+				return idx;
 			cmd = vfio_pci_memory_lock_and_enable(vdev);
 			io = pci_map_rom(pdev, &size);
 			if (io) {
@@ -1223,6 +1233,7 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 				pci_unmap_rom(pdev, io);
 			}
 			vfio_pci_memory_unlock_and_restore(vdev, cmd);
+			vfio_pci_core_access_end(vdev, idx);
 		} else if (pdev->rom && pdev->romlen) {
 			info->flags = VFIO_REGION_INFO_FLAG_READ;
 			/* Report BAR size as power of two. */

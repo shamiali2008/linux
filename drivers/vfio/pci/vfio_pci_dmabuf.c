@@ -227,7 +227,7 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct vfio_pci_dma_buf *priv;
 	size_t length;
-	int ret;
+	int ret, idx;
 
 	if (!vdev->pci_ops || !vdev->pci_ops->get_dmabuf_phys)
 		return -EOPNOTSUPP;
@@ -274,19 +274,26 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	priv->vdev = vdev;
 	priv->nr_ranges = get_dma_buf.nr_ranges;
 	priv->size = length;
+
+	idx = vfio_pci_core_access_begin(vdev);
+	if (idx < 0) {
+		ret = idx;
+		goto err_free_phys;
+	}
+
 	ret = vdev->pci_ops->get_dmabuf_phys(vdev, &priv->provider,
 					     get_dma_buf.region_index,
 					     priv->phys_vec, dma_ranges,
 					     priv->nr_ranges);
 	if (ret)
-		goto err_free_phys;
+		goto err_access;
 
 	kfree(dma_ranges);
 	dma_ranges = NULL;
 
 	if (!vfio_device_try_get_registration(&vdev->vdev)) {
 		ret = -ENODEV;
-		goto err_free_phys;
+		goto err_access;
 	}
 
 	exp_info.ops = &vfio_pci_dmabuf_ops;
@@ -311,6 +318,7 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	list_add_tail(&priv->dmabufs_elm, &vdev->dmabufs);
 	dma_resv_unlock(priv->dmabuf->resv);
 	up_write(&vdev->memory_lock);
+	vfio_pci_core_access_end(vdev, idx);
 
 	/*
 	 * dma_buf_fd() consumes the reference, when the file closes the dmabuf
@@ -324,6 +332,8 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 
 err_dev_put:
 	vfio_device_put_registration(&vdev->vdev);
+err_access:
+	vfio_pci_core_access_end(vdev, idx);
 err_free_phys:
 	kfree(priv->phys_vec);
 err_free_priv:
