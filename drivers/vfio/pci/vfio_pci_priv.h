@@ -25,6 +25,10 @@ struct vfio_pci_ioeventfd {
 
 bool vfio_pci_intx_mask(struct vfio_pci_core_device *vdev);
 void vfio_pci_intx_unmask(struct vfio_pci_core_device *vdev);
+void vfio_pci_intx_recovery_start(struct vfio_pci_core_device *vdev);
+void vfio_pci_intx_recovery_finish(struct vfio_pci_core_device *vdev);
+u16 vfio_pci_intx_recovery_update_command(struct vfio_pci_core_device *vdev,
+					  u16 command);
 
 int vfio_pci_eventfd_replace_locked(struct vfio_pci_core_device *vdev,
 				    struct vfio_pci_eventfd __rcu **peventfd,
