@@ -371,6 +371,7 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 			vdev->pm_save = pci_store_saved_state(pdev);
 		} else if (needs_restore) {
 			pci_load_and_free_saved_state(pdev, &vdev->pm_save);
+			vfio_pci_recovery_mask_saved_intx(vdev);
 			pci_restore_state(pdev);
 		}
 	}
@@ -2615,6 +2616,87 @@ out_failed:
 	return PCI_ERS_RESULT_NONE;
 }
 
+static void vfio_pci_core_aer_resume(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+	unsigned long irq_flags;
+	bool notify_recovery = false;
+	bool power_up;
+	u32 flags;
+	int ret = 0;
+
+	mutex_lock(&vdev->access_lock);
+	vdev->pci_recovery_host_active = false;
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS))
+		goto out_unlock;
+
+	notify_recovery = true;
+	down_write(&vdev->memory_lock);
+	/*
+	 * Apply deferred D0 requests before restoring PCI_COMMAND.
+	 * slot_reset() has already established D0 after a reset.
+	 */
+	power_up = vdev->power_up_pending;
+	vdev->power_up_pending = false;
+	if (power_up && !(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_RESET)) {
+		ret = vfio_pci_set_power_state(vdev, PCI_D0);
+		if (ret)
+			goto out_memory;
+	}
+
+	/*
+	 * Serialize with INTx updates to PCI_COMMAND. Keep masked INTx
+	 * disabled until vfio_pci_intx_recovery_finish().
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_RESET) &&
+	    vdev->pci_recovery_command_valid) {
+		u16 cmd = vdev->pci_recovery_command;
+
+		cmd = vfio_pci_intx_recovery_update_command(vdev, cmd);
+		ret = pci_write_config_word(pdev, PCI_COMMAND, cmd);
+	}
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+	if (ret)
+		goto out_memory;
+
+	/*
+	 * A saved-state restore may leave ROM decode enabled. Disable it
+	 * before allowing access to shared decoders.
+	 */
+	if (pci_resource_start(pdev, PCI_ROM_RESOURCE) &&
+	    !(pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_ENABLE))
+		pci_disable_rom(pdev);
+
+	/*
+	 * Finish restoring hardware state before allowing accesses.
+	 * Serialize the flag update with the INTx handler.
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	WRITE_ONCE(vdev->access_blocked, false);
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+
+	if (__vfio_pci_memory_enabled(vdev))
+		vfio_pci_dma_buf_move(vdev, false);
+
+out_memory:
+	up_write(&vdev->memory_lock);
+	vdev->pci_recovery_command_valid = false;
+	flags = vdev->pci_recovery_flags & ~VFIO_PCI_RECOVERY_IN_PROGRESS;
+	if (ret) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   flags | VFIO_PCI_RECOVERY_FAILED);
+		goto out_unlock;
+	}
+	WRITE_ONCE(vdev->pci_recovery_flags, flags);
+	vfio_pci_intx_recovery_finish(vdev);
+
+out_unlock:
+	mutex_unlock(&vdev->access_lock);
+	if (notify_recovery)
+		vfio_pci_signal_recovery_event(vdev);
+}
+
 int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
 				  int nr_virtfn)
 {
@@ -2688,6 +2770,7 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 const struct pci_error_handlers vfio_pci_core_err_handlers = {
 	.error_detected = vfio_pci_core_aer_err_detected,
 	.slot_reset = vfio_pci_core_aer_slot_reset,
+	.resume = vfio_pci_core_aer_resume,
 };
 EXPORT_SYMBOL_GPL(vfio_pci_core_err_handlers);
 
