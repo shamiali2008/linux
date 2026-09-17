@@ -1666,6 +1666,10 @@ static ssize_t vfio_pci_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 	if (index >= VFIO_PCI_NUM_REGIONS + vdev->num_regions)
 		return -EINVAL;
 
+	/* Avoid runtime resume when blocked; region handlers check access again. */
+	if (vdev->pci_recovery_supported && READ_ONCE(vdev->access_blocked))
+		return -EIO;
+
 	ret = pm_runtime_resume_and_get(&vdev->pdev->dev);
 	if (ret) {
 		pci_info_ratelimited(vdev->pdev, "runtime resume failed %d\n",

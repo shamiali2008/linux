@@ -44,10 +44,17 @@
 int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,	\
 			bool test_mem, u##size val, void __iomem *io)	\
 {									\
+	int idx;							\
+									\
+	idx = vfio_pci_core_access_begin(vdev);				\
+	if (idx < 0)							\
+		return idx;						\
+									\
 	if (test_mem) {							\
 		down_read(&vdev->memory_lock);				\
 		if (!__vfio_pci_memory_enabled(vdev)) {			\
 			up_read(&vdev->memory_lock);			\
+			vfio_pci_core_access_end(vdev, idx);		\
 			return -EIO;					\
 		}							\
 	}								\
@@ -56,6 +63,7 @@ int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,	\
 									\
 	if (test_mem)							\
 		up_read(&vdev->memory_lock);				\
+	vfio_pci_core_access_end(vdev, idx);				\
 									\
 	return 0;							\
 }									\
@@ -70,10 +78,17 @@ VFIO_IOWRITE(64)
 int vfio_pci_core_ioread##size(struct vfio_pci_core_device *vdev,	\
 			bool test_mem, u##size *val, void __iomem *io)	\
 {									\
+	int idx;							\
+									\
+	idx = vfio_pci_core_access_begin(vdev);				\
+	if (idx < 0)							\
+		return idx;						\
+									\
 	if (test_mem) {							\
 		down_read(&vdev->memory_lock);				\
 		if (!__vfio_pci_memory_enabled(vdev)) {			\
 			up_read(&vdev->memory_lock);			\
+			vfio_pci_core_access_end(vdev, idx);		\
 			return -EIO;					\
 		}							\
 	}								\
@@ -82,6 +97,7 @@ int vfio_pci_core_ioread##size(struct vfio_pci_core_device *vdev,	\
 									\
 	if (test_mem)							\
 		up_read(&vdev->memory_lock);				\
+	vfio_pci_core_access_end(vdev, idx);				\
 									\
 	return 0;							\
 }									\
@@ -209,6 +225,11 @@ static ssize_t vfio_pci_rom_read(struct vfio_pci_core_device *vdev,
 	void *data = NULL;
 	void __iomem *io;
 	ssize_t ret;
+	int idx;
+
+	idx = vfio_pci_core_access_begin(vdev);
+	if (idx < 0)
+		return idx;
 
 	/* Serialize ROM decoding with power-state and other ROM accesses. */
 	down_write(&vdev->memory_lock);
@@ -272,6 +293,7 @@ out_unmap:
 		iounmap(io);
 out_unlock:
 	up_write(&vdev->memory_lock);
+	vfio_pci_core_access_end(vdev, idx);
 	if (ret < 0)
 		goto out_free;
 
