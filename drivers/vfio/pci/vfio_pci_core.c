@@ -617,6 +617,15 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 	u16 cmd;
 	u8 msix_pos;
 
+	if (vdev->pci_recovery_supported) {
+		if (pci_dev_is_disconnected(pdev))
+			return -ENODEV;
+		scoped_guard(mutex, &vdev->access_lock) {
+			if (vdev->pci_recovery_host_active)
+				return -EBUSY;
+		}
+	}
+
 	if (!vdev->disable_idle_d3) {
 		ret = pm_runtime_resume_and_get(&pdev->dev);
 		if (ret < 0)
@@ -860,6 +869,10 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 			WRITE_ONCE(vdev->access_blocked, false);
 			WRITE_ONCE(vdev->device_open, false);
 			WRITE_ONCE(vdev->pci_recovery_flags, 0);
+			/* Discard pending D0 so it cannot be replayed after reopen. */
+			down_write(&vdev->memory_lock);
+			vdev->power_up_pending = false;
+			up_write(&vdev->memory_lock);
 		}
 	}
 
@@ -1843,6 +1856,15 @@ void vfio_pci_core_access_end(struct vfio_pci_core_device *vdev, int idx)
 		srcu_read_unlock(&vdev->access_srcu, idx);
 }
 
+/* Reject new accesses and wait for existing SRCU readers. */
+static void vfio_pci_core_block_access(struct vfio_pci_core_device *vdev)
+{
+	lockdep_assert_held(&vdev->access_lock);
+
+	WRITE_ONCE(vdev->access_blocked, true);
+	synchronize_srcu(&vdev->access_srcu);
+}
+
 ssize_t vfio_pci_core_read(struct vfio_device *core_vdev, char __user *buf,
 		size_t count, loff_t *ppos)
 {
@@ -2521,19 +2543,147 @@ vfio_pci_signal_recovery_event(struct vfio_pci_core_device *vdev)
 	rcu_read_unlock();
 }
 
+/*
+ * Save PCI_COMMAND, clear bus mastering and set the requested bits.
+ * Reject an all-ones read from an inaccessible device.
+ */
+static int
+vfio_pci_recovery_save_and_clear_master(struct vfio_pci_core_device *vdev, u16 set)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	u16 command;
+	int ret;
+
+	ret = pci_read_config_word(pdev, PCI_COMMAND, &vdev->pci_recovery_command);
+	if (ret)
+		return ret;
+	if (PCI_POSSIBLE_ERROR(vdev->pci_recovery_command))
+		return -EIO;
+
+	command = (vdev->pci_recovery_command & ~PCI_COMMAND_MASTER) | set;
+	ret = pci_write_config_word(pdev, PCI_COMMAND, command);
+	if (ret)
+		return ret;
+
+	vdev->pci_recovery_command_valid = true;
+	return 0;
+}
+
 pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 						pci_channel_state_t state)
 {
 	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
 	struct vfio_pci_eventfd *eventfd;
+	pci_ers_result_t result = PCI_ERS_RESULT_CAN_RECOVER;
+	unsigned long irq_flags;
+	bool notify_recovery = false;
+	bool nested;
+	u32 flags;
+	int ret = 0;
 
+	if (!vdev->pci_recovery_supported)
+		goto out;
+
+	mutex_lock(&vdev->access_lock);
+	/*
+	 * Track the host transaction even when userspace has not enabled
+	 * recovery. Reopen must wait for resume() or permanent failure.
+	 */
+	vdev->pci_recovery_host_active =
+		state != pci_channel_io_perm_failure;
+	if (!vdev->pci_recovery_enabled)
+		goto out_unlock;
+
+	/* Keep failed devices blocked until close. */
+	if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_FAILED) {
+		result = PCI_ERS_RESULT_NONE;
+		goto out_unlock;
+	}
+
+	if (!vdev->device_open) {
+		result = PCI_ERS_RESULT_NONE;
+		goto out_unlock;
+	}
+
+	notify_recovery = true;
+	vfio_pci_core_block_access(vdev);
+	/*
+	 * Preserve the saved command for nested events. The current value
+	 * may already have bus mastering disabled by recovery.
+	 */
+	nested = vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS;
+	if (!nested)
+		vdev->pci_recovery_command_valid = false;
+	vfio_pci_intx_recovery_start(vdev);
+	vfio_pci_zap_and_down_write_memory_lock(vdev);
+	/*
+	 * Serialize PCI_COMMAND updates with the INTx handler, which does
+	 * not take access_srcu.
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	if (state == pci_channel_io_normal && vdev->pci_2_3 && !nested)
+		ret = vfio_pci_recovery_save_and_clear_master(
+			vdev, PCI_COMMAND_INTX_DISABLE);
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+	vfio_pci_dma_buf_move(vdev, true);
+
+	/*
+	 * Start a new sequence unless this event belongs to an active
+	 * transaction. Publish the flags in one store to avoid exposing
+	 * a transient cleared state to lockless readers.
+	 */
+	if (nested) {
+		flags = vdev->pci_recovery_flags;
+	} else {
+		if (++vdev->pci_recovery_sequence == 0)
+			vdev->pci_recovery_sequence++;
+		flags = 0;
+	}
+
+	if (state == pci_channel_io_perm_failure) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   (flags | VFIO_PCI_RECOVERY_FAILED) &
+			   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+		vdev->pci_recovery_command_valid = false;
+		result = PCI_ERS_RESULT_DISCONNECT;
+		goto out_memory;
+	}
+
+	if (state == pci_channel_io_frozen) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   flags | VFIO_PCI_RECOVERY_IN_PROGRESS |
+			   VFIO_PCI_RECOVERY_FROZEN);
+		result = PCI_ERS_RESULT_NEED_RESET;
+		goto out_memory;
+	}
+
+	if (!ret && !vdev->pci_2_3 && !nested)
+		ret = vfio_pci_recovery_save_and_clear_master(vdev, 0);
+
+	if (ret) {
+		flags |= VFIO_PCI_RECOVERY_FAILED;
+		flags &= ~VFIO_PCI_RECOVERY_IN_PROGRESS;
+		result = PCI_ERS_RESULT_NONE;
+	} else {
+		flags |= VFIO_PCI_RECOVERY_IN_PROGRESS;
+	}
+	WRITE_ONCE(vdev->pci_recovery_flags, flags);
+
+out_memory:
+	up_write(&vdev->memory_lock);
+out_unlock:
+	mutex_unlock(&vdev->access_lock);
+
+out:
 	rcu_read_lock();
 	eventfd = rcu_dereference(vdev->err_trigger);
 	if (eventfd)
 		eventfd_signal(eventfd->ctx);
 	rcu_read_unlock();
+	if (notify_recovery)
+		vfio_pci_signal_recovery_event(vdev);
 
-	return PCI_ERS_RESULT_CAN_RECOVER;
+	return result;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_err_detected);
 
@@ -2922,6 +3072,20 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 		 * runaway and unwind if we hit contention.
 		 */
 		if (!down_write_trylock(&vdev->memory_lock)) {
+			ret = -EBUSY;
+			break;
+		}
+
+		/*
+		 * Recovery releases memory_lock between callbacks. Check the
+		 * access block after taking the lock as well. Allow failed
+		 * devices so they do not prevent resetting healthy siblings.
+		 */
+		if (vdev->pci_recovery_supported &&
+		    READ_ONCE(vdev->access_blocked) &&
+		    !(READ_ONCE(vdev->pci_recovery_flags) &
+		      VFIO_PCI_RECOVERY_FAILED)) {
+			up_write(&vdev->memory_lock);
 			ret = -EBUSY;
 			break;
 		}

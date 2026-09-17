@@ -350,6 +350,11 @@ void vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
 
 	lockdep_assert_held_write(&vdev->memory_lock);
 
+	/* Reset and power-state cleanup must not undo recovery revocation. */
+	if (!revoked && vdev->pci_recovery_supported &&
+	    READ_ONCE(vdev->access_blocked))
+		return;
+
 	list_for_each_entry_safe(priv, tmp, &vdev->dmabufs, dmabufs_elm) {
 		if (!get_file_active(&priv->dmabuf->file))
 			continue;

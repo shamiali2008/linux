@@ -213,6 +213,9 @@ static int vfio_pci_sriov_configure(struct pci_dev *pdev, int nr_virtfn)
 	if (!enable_sriov)
 		return -ENOENT;
 
+	if (vdev->pci_recovery_supported && READ_ONCE(vdev->access_blocked))
+		return -EIO;
+
 	return vfio_pci_core_sriov_configure(vdev, nr_virtfn);
 }
 
