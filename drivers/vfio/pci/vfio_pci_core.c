@@ -1842,8 +1842,19 @@ static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	if (is_aligned_for_order(vma, addr, pfn, order)) {
+		int idx;
+
+		/*
+		 * Hold access_srcu across PFN insertion so recovery cannot
+		 * finish revoking mappings before this insertion completes.
+		 */
+		idx = vfio_pci_core_access_begin(vdev);
+		if (idx < 0)
+			return VM_FAULT_SIGBUS;
+
 		scoped_guard(rwsem_read, &vdev->memory_lock)
 			ret = vfio_pci_vmf_insert_pfn(vdev, vmf, pfn, order);
+		vfio_pci_core_access_end(vdev, idx);
 	}
 
 	dev_dbg_ratelimited(&vdev->pdev->dev,
