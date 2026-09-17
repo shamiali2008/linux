@@ -311,6 +311,15 @@ static void vfio_pci_probe_power_state(struct vfio_pci_core_device *vdev)
 	vdev->needs_pm_restore = !(pmcsr & PCI_PM_CTRL_NO_SOFT_RESET);
 }
 
+/* Keep recovery's INTx mask when restoring a loaded PCI state snapshot. */
+static void vfio_pci_recovery_mask_saved_intx(struct vfio_pci_core_device *vdev)
+{
+	if (READ_ONCE(vdev->access_blocked) && vdev->pci_2_3 &&
+	    READ_ONCE(vdev->irq_type) == VFIO_PCI_INTX_IRQ_INDEX)
+		vdev->pdev->saved_config_space[PCI_COMMAND / 4] |=
+			PCI_COMMAND_INTX_DISABLE;
+}
+
 /*
  * pci_set_power_state() wrapper handling devices which perform a soft reset on
  * D3->D0 transition.  Save state prior to D0/1/2->D3, stash it on the vdev,
@@ -2499,6 +2508,18 @@ void vfio_pci_core_unregister_device(struct vfio_pci_core_device *vdev)
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_device);
 
+static void
+vfio_pci_signal_recovery_event(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_eventfd *eventfd;
+
+	rcu_read_lock();
+	eventfd = rcu_dereference(vdev->pci_recovery_trigger);
+	if (eventfd)
+		eventfd_signal(eventfd->ctx);
+	rcu_read_unlock();
+}
+
 pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 						pci_channel_state_t state)
 {
@@ -2514,6 +2535,85 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 	return PCI_ERS_RESULT_CAN_RECOVER;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_err_detected);
+
+/* Caller holds memory_lock. Discard the pre-reset PM snapshot. */
+static int vfio_pci_recovery_restore_state(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	int ret;
+
+	if (!vdev->pci_saved_state)
+		return -ENODATA;
+	ret = pci_load_saved_state(pdev, vdev->pci_saved_state);
+	if (ret)
+		return ret;
+
+	kfree(vdev->pm_save);
+	vdev->pm_save = NULL;
+	ret = pci_set_power_state(pdev, PCI_D0);
+	if (ret)
+		return ret;
+
+	vfio_pci_recovery_mask_saved_intx(vdev);
+	pci_restore_state(pdev);
+	return 0;
+}
+
+static pci_ers_result_t vfio_pci_core_aer_slot_reset(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+	int ret = 0;
+
+	mutex_lock(&vdev->access_lock);
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS) ||
+	    !vdev->device_open) {
+		mutex_unlock(&vdev->access_lock);
+		return PCI_ERS_RESULT_NONE;
+	}
+
+	/*
+	 * Load the open snapshot before D0, which may restore BARs from
+	 * saved state. Restore BARs before IRQ teardown so MSI-X shutdown
+	 * can access the table after the host reset.
+	 */
+	down_write(&vdev->memory_lock);
+	ret = vfio_pci_recovery_restore_state(vdev);
+	up_write(&vdev->memory_lock);
+	if (ret)
+		goto out_failed;
+
+	/*
+	 * Close clears device_open under access_lock before IRQ teardown,
+	 * excluding this callback from the teardown path.
+	 */
+	mutex_lock(&vdev->igate);
+	if (vdev->irq_type < VFIO_PCI_NUM_IRQS)
+		ret = vfio_pci_set_irqs_ioctl(vdev,
+					      VFIO_IRQ_SET_DATA_NONE |
+					      VFIO_IRQ_SET_ACTION_TRIGGER,
+					      vdev->irq_type, 0, 0, NULL);
+	mutex_unlock(&vdev->igate);
+	if (ret)
+		goto out_failed;
+
+	WRITE_ONCE(vdev->pci_recovery_flags,
+		   vdev->pci_recovery_flags | VFIO_PCI_RECOVERY_RESET);
+	mutex_unlock(&vdev->access_lock);
+
+	return PCI_ERS_RESULT_RECOVERED;
+
+out_failed:
+	WRITE_ONCE(vdev->pci_recovery_flags,
+		   (vdev->pci_recovery_flags | VFIO_PCI_RECOVERY_FAILED) &
+		   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+	vdev->pci_recovery_command_valid = false;
+	mutex_unlock(&vdev->access_lock);
+	/* Report failure here; resume() skips completed transactions. */
+	vfio_pci_signal_recovery_event(vdev);
+
+	/* Allow recovery of other devices under the bridge to continue. */
+	return PCI_ERS_RESULT_NONE;
+}
 
 int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
 				  int nr_virtfn)
@@ -2587,6 +2687,7 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 
 const struct pci_error_handlers vfio_pci_core_err_handlers = {
 	.error_detected = vfio_pci_core_aer_err_detected,
+	.slot_reset = vfio_pci_core_aer_slot_reset,
 };
 EXPORT_SYMBOL_GPL(vfio_pci_core_err_handlers);
 
