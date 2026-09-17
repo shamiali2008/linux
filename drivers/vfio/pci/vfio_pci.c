@@ -129,6 +129,7 @@ static int vfio_pci_init_dev(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+	struct pci_dev *pdev = to_pci_dev(core_vdev->dev);
 
 	/*
 	 * These behaviors originated in vfio-pci and moved into
@@ -139,6 +140,14 @@ static int vfio_pci_init_dev(struct vfio_device *core_vdev)
 	 */
 	vdev->nointxmask = nointxmask;
 	vdev->disable_idle_d3 = disable_idle_d3;
+	/*
+	 * CXL RCH and s390 mediated recovery can omit completion callbacks.
+	 * s390 also blocks config access across failure notification, which
+	 * prevents draining SRCU readers waiting for config access.
+	 */
+	if (!IS_ENABLED(CONFIG_S390) &&
+	    (pdev->class >> 8) != PCI_CLASS_MEMORY_CXL)
+		vdev->pci_recovery_supported = true;
 #ifdef CONFIG_VFIO_PCI_VGA
 	vdev->disable_vga = disable_vga;
 #endif
