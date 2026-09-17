@@ -96,6 +96,11 @@ static inline int vfio_pci_core_get_dmabuf_phys(
 }
 #endif
 
+#define VFIO_PCI_RECOVERY_IN_PROGRESS	BIT(0)
+#define VFIO_PCI_RECOVERY_FROZEN	BIT(1)
+#define VFIO_PCI_RECOVERY_RESET		BIT(2)
+#define VFIO_PCI_RECOVERY_FAILED	BIT(3)
+
 struct vfio_pci_core_device {
 	struct vfio_device	vdev;
 	struct pci_dev		*pdev;
@@ -143,6 +148,7 @@ struct vfio_pci_core_device {
 	int			ioeventfds_nr;
 	struct vfio_pci_eventfd __rcu *err_trigger;
 	struct vfio_pci_eventfd __rcu *req_trigger;
+	struct vfio_pci_eventfd __rcu *pci_recovery_trigger;
 	struct eventfd_ctx	*pm_wake_eventfd_ctx;
 	struct list_head	dummy_resources_list;
 	struct mutex		ioeventfds_lock;
@@ -168,7 +174,18 @@ struct vfio_pci_core_device {
 	bool			access_blocked;
 	/* Set after open completes, cleared before close tears down state. */
 	bool			device_open;
-	struct mutex		access_lock;	/* gate flag writers */
+	struct mutex		access_lock;	/* gate and recovery state writers */
+	u32			pci_recovery_flags;
+	u64			pci_recovery_sequence;
+	/* Saved PCI_COMMAND, valid when pci_recovery_command_valid is set. */
+	u16			pci_recovery_command;
+	bool			pci_recovery_enabled;
+	bool			pci_recovery_command_valid;
+	/*
+	 * Host recovery in progress, protected by access_lock. Unlike the
+	 * per-open recovery flags, this is preserved across close.
+	 */
+	bool			pci_recovery_host_active;
 	struct list_head	dmabufs;
 };
 

@@ -845,8 +845,11 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 
 	if (vdev->pci_recovery_supported) {
 		scoped_guard(mutex, &vdev->access_lock) {
+			WRITE_ONCE(vdev->pci_recovery_enabled, false);
+			vdev->pci_recovery_command_valid = false;
 			WRITE_ONCE(vdev->access_blocked, false);
 			WRITE_ONCE(vdev->device_open, false);
+			WRITE_ONCE(vdev->pci_recovery_flags, 0);
 		}
 	}
 
@@ -866,6 +869,10 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 	mutex_lock(&vdev->igate);
 	vfio_pci_eventfd_replace_locked(vdev, &vdev->err_trigger, NULL);
 	vfio_pci_eventfd_replace_locked(vdev, &vdev->req_trigger, NULL);
+	if (vdev->pci_recovery_supported)
+		vfio_pci_eventfd_replace_locked(vdev,
+						&vdev->pci_recovery_trigger,
+						NULL);
 	mutex_unlock(&vdev->igate);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_close_device);
@@ -885,6 +892,10 @@ void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
 
 	if (vdev->pci_recovery_supported) {
 		guard(mutex)(&vdev->access_lock);
+		WRITE_ONCE(vdev->pci_recovery_flags, 0);
+		vdev->pci_recovery_sequence = 0;
+		vdev->pci_recovery_command_valid = false;
+		WRITE_ONCE(vdev->pci_recovery_enabled, false);
 		WRITE_ONCE(vdev->access_blocked, false);
 		WRITE_ONCE(vdev->device_open, true);
 	}
