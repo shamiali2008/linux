@@ -1555,6 +1555,50 @@ struct vfio_device_feature_zpci_err {
 
 #define VFIO_DEVICE_FEATURE_ZPCI_ERROR 13
 
+/*
+ * Report host PCI error recovery state for this device.
+ *
+ * VFIO_DEVICE_FEATURE_SET with a valid eventfd enables recovery for this
+ * open and registers notifications for the start and end of each event.
+ * SET with eventfd -1 disables recovery. flags and sequence must be zero.
+ * SET returns -EBUSY during recovery, after recovery failure, or while
+ * device access is blocked, and -ENODEV after close has started.
+ * VFIO_PCI_ERR_IRQ_INDEX notifications are unchanged.
+ *
+ * VFIO_DEVICE_FEATURE_GET returns the current state and eventfd = -1.
+ * GET is allowed during recovery, but may wait for a running callback.
+ *
+ * The sequence number increments for each event and resets to zero when
+ * recovery is enabled. Use it to detect coalesced notifications. Device
+ * accesses return -EIO while IN_PROGRESS is set. Recovery may complete
+ * before userspace reads the notification, so userspace must check the
+ * sequence and status rather than wait to observe IN_PROGRESS.
+ *
+ * CHANNEL_FROZEN records a frozen channel. DEVICE_RESET records a host
+ * reset; userspace must reconfigure interrupts with VFIO_DEVICE_SET_IRQS.
+ * FAILED indicates that recovery failed and access remains blocked until
+ * close and reopen. Status bits persist until the next event or SET.
+ * ENABLED indicates that recovery is enabled.
+ *
+ * Enabling recovery during an existing event does not provide status or
+ * notifications for that event.
+ *
+ * Open returns -EBUSY while a previously recorded host recovery is active,
+ * including events reported while recovery was disabled.
+ */
+struct vfio_device_pci_error_recovery {
+	__u32 flags;
+#define VFIO_PCI_ERROR_RECOVERY_IN_PROGRESS	(1U << 0)
+#define VFIO_PCI_ERROR_RECOVERY_CHANNEL_FROZEN	(1U << 1)
+#define VFIO_PCI_ERROR_RECOVERY_DEVICE_RESET	(1U << 2)
+#define VFIO_PCI_ERROR_RECOVERY_FAILED		(1U << 3)
+#define VFIO_PCI_ERROR_RECOVERY_ENABLED		(1U << 4)
+	__s32 eventfd;
+	__aligned_u64 sequence;
+};
+
+#define VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY 14
+
 /* -------- API for Type1 VFIO IOMMU -------- */
 
 /**

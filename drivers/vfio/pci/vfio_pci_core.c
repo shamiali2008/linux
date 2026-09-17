@@ -1752,6 +1752,111 @@ static int vfio_pci_core_feature_token(struct vfio_pci_core_device *vdev,
 	return 0;
 }
 
+/* Consumes the eventfd reference on both success and failure. */
+static int vfio_pci_recovery_set(struct vfio_pci_core_device *vdev,
+				 struct eventfd_ctx *ctx, bool enable)
+{
+	int ret;
+
+	guard(mutex)(&vdev->access_lock);
+	if (!vdev->device_open) {
+		ret = -ENODEV;
+		goto out_put;
+	}
+	if (vdev->access_blocked) {
+		ret = -EBUSY;
+		goto out_put;
+	}
+	if (!enable &&
+	    (vdev->pci_recovery_flags &
+	     (VFIO_PCI_RECOVERY_IN_PROGRESS | VFIO_PCI_RECOVERY_FAILED))) {
+		ret = -EBUSY;
+		goto out_put;
+	}
+
+	mutex_lock(&vdev->igate);
+	ret = vfio_pci_eventfd_replace_locked(vdev, &vdev->pci_recovery_trigger,
+					      ctx);
+	mutex_unlock(&vdev->igate);
+	if (ret)
+		goto out_put;
+
+	WRITE_ONCE(vdev->pci_recovery_enabled, enable);
+	/*
+	 * Reset the per-open status when updating the recovery eventfd.
+	 * The access block and host transaction state are unchanged.
+	 */
+	WRITE_ONCE(vdev->pci_recovery_flags, 0);
+	vdev->pci_recovery_sequence = 0;
+	vdev->pci_recovery_command_valid = false;
+
+	return 0;
+
+out_put:
+	if (ctx)
+		eventfd_ctx_put(ctx);
+	return ret;
+}
+
+static int
+vfio_pci_core_feature_error_recovery(struct vfio_pci_core_device *vdev, u32 flags,
+				     struct vfio_device_pci_error_recovery __user *arg,
+				     size_t argsz)
+{
+	struct vfio_device_pci_error_recovery state = { .eventfd = -1 };
+	struct eventfd_ctx *ctx = NULL;
+	bool enable;
+	int ret;
+
+	if (!vdev->pci_recovery_supported)
+		return -ENOTTY;
+
+	ret = vfio_check_feature(flags, argsz,
+				 VFIO_DEVICE_FEATURE_GET |
+				 VFIO_DEVICE_FEATURE_SET, sizeof(state));
+	if (ret != 1)
+		return ret;
+
+	if (flags & VFIO_DEVICE_FEATURE_GET) {
+		scoped_guard(mutex, &vdev->access_lock) {
+			u32 rflags = vdev->pci_recovery_flags;
+
+			if (vdev->pci_recovery_enabled)
+				state.flags |= VFIO_PCI_ERROR_RECOVERY_ENABLED;
+			if (rflags & VFIO_PCI_RECOVERY_IN_PROGRESS)
+				state.flags |=
+					VFIO_PCI_ERROR_RECOVERY_IN_PROGRESS;
+			if (rflags & VFIO_PCI_RECOVERY_FROZEN)
+				state.flags |=
+					VFIO_PCI_ERROR_RECOVERY_CHANNEL_FROZEN;
+			if (rflags & VFIO_PCI_RECOVERY_RESET)
+				state.flags |=
+					VFIO_PCI_ERROR_RECOVERY_DEVICE_RESET;
+			if (rflags & VFIO_PCI_RECOVERY_FAILED)
+				state.flags |= VFIO_PCI_ERROR_RECOVERY_FAILED;
+			state.sequence = vdev->pci_recovery_sequence;
+		}
+
+		if (copy_to_user(arg, &state, sizeof(state)))
+			return -EFAULT;
+		return 0;
+	}
+
+	if (copy_from_user(&state, arg, sizeof(state)))
+		return -EFAULT;
+	if (state.flags || state.sequence || state.eventfd < -1)
+		return -EINVAL;
+
+	enable = state.eventfd >= 0;
+	if (enable) {
+		ctx = eventfd_ctx_fdget(state.eventfd);
+		if (IS_ERR(ctx))
+			return PTR_ERR(ctx);
+	}
+
+	return vfio_pci_recovery_set(vdev, ctx, enable);
+}
+
 int vfio_pci_core_ioctl_feature(struct vfio_device *device, u32 flags,
 				void __user *arg, size_t argsz)
 {
@@ -1772,6 +1877,9 @@ int vfio_pci_core_ioctl_feature(struct vfio_device *device, u32 flags,
 		return vfio_pci_core_feature_dma_buf(vdev, flags, arg, argsz);
 	case VFIO_DEVICE_FEATURE_ZPCI_ERROR:
 		return vfio_pci_zdev_feature_err(device, flags, arg, argsz);
+
+	case VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY:
+		return vfio_pci_core_feature_error_recovery(vdev, flags, arg, argsz);
 	default:
 		return -ENOTTY;
 	}
