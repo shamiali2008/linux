@@ -372,6 +372,12 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 				     struct eventfd_ctx *efdctx)
 {
+	int idx;
+
+	idx = vfio_pci_core_access_begin(vdev);
+	if (idx < 0)
+		return idx;
+
 	/*
 	 * The vdev power related flags are protected with 'memory_lock'
 	 * semaphore.
@@ -381,6 +387,7 @@ static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 
 	if (vdev->pm_runtime_engaged) {
 		up_write(&vdev->memory_lock);
+		vfio_pci_core_access_end(vdev, idx);
 		return -EINVAL;
 	}
 
@@ -388,6 +395,7 @@ static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 	vdev->pm_wake_eventfd_ctx = efdctx;
 	pm_runtime_put_noidle(&vdev->pdev->dev);
 	up_write(&vdev->memory_lock);
+	vfio_pci_core_access_end(vdev, idx);
 
 	return 0;
 }
@@ -470,7 +478,7 @@ static void vfio_pci_runtime_pm_exit(struct vfio_pci_core_device *vdev)
 static int vfio_pci_core_pm_exit(struct vfio_pci_core_device *vdev, u32 flags,
 				 void __user *arg, size_t argsz)
 {
-	int ret;
+	int ret, idx;
 
 	ret = vfio_check_feature(flags, argsz, VFIO_DEVICE_FEATURE_SET, 0);
 	if (ret != 1)
@@ -483,7 +491,11 @@ static int vfio_pci_core_pm_exit(struct vfio_pci_core_device *vdev, u32 flags,
 	 * already signaled the eventfd and exited low power mode itself.
 	 * pm_runtime_engaged protects the redundant call here.
 	 */
+	idx = vfio_pci_core_access_begin(vdev);
+	if (idx < 0)
+		return idx;
 	vfio_pci_runtime_pm_exit(vdev);
+	vfio_pci_core_access_end(vdev, idx);
 	return 0;
 }
 
@@ -1387,12 +1399,16 @@ out_free:
 static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 				void __user *arg)
 {
-	int ret;
+	int ret, idx;
 
 	if (!vdev->reset_works)
 		return -EINVAL;
 
 	vfio_pci_zap_and_down_write_memory_lock(vdev);
+	if (vdev->pci_recovery_supported && READ_ONCE(vdev->access_blocked)) {
+		up_write(&vdev->memory_lock);
+		return -EIO;
+	}
 
 	/*
 	 * This function can be invoked while the power state is non-D0. If
@@ -1402,14 +1418,26 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 	 * have NoSoftRst-, the reset function can cause the PCI config space
 	 * reset without restoring the original state (saved locally in
 	 * 'vdev->pm_save').
+	 *
+	 * Do the D0 transition outside access_srcu because it can acquire
+	 * pci_bus_sem through ASPM. Keep memory_lock held through reset to
+	 * prevent a concurrent power-state write from putting the device in D3.
 	 */
 	vfio_pci_set_power_state(vdev, PCI_D0);
+
+	idx = vfio_pci_core_access_begin(vdev);
+	if (idx < 0) {
+		up_write(&vdev->memory_lock);
+		return idx;
+	}
 
 	vfio_pci_dma_buf_move(vdev, true);
 	ret = pci_try_reset_function(vdev->pdev);
 	if (__vfio_pci_memory_enabled(vdev))
 		vfio_pci_dma_buf_move(vdev, false);
 	up_write(&vdev->memory_lock);
+
+	vfio_pci_core_access_end(vdev, idx);
 
 	return ret;
 }

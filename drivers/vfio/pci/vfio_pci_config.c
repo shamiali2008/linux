@@ -720,8 +720,8 @@ static int __init init_pci_cap_basic_perm(struct perm_bits *perm)
  * It takes all the required locks to protect the access of power related
  * variables and then invokes vfio_pci_set_power_state().
  */
-static int vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
-					 pci_power_t state)
+int vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
+				 pci_power_t state)
 {
 	if (state >= PCI_D3hot) {
 		vfio_pci_zap_and_down_write_memory_lock(vdev);

@@ -41,6 +41,9 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 				  char __user *buf, size_t count, loff_t *ppos,
 				  bool iswrite);
 
+int vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
+				 pci_power_t state);
+
 ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite);
 
