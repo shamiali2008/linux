@@ -10,8 +10,10 @@
  * Author: Tom Lyon, pugs@cisco.com
  */
 
+#include <linux/align.h>
 #include <linux/fs.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/io.h>
 #include <linux/vfio.h>
@@ -198,6 +200,96 @@ ssize_t vfio_pci_core_do_io_rw(struct vfio_pci_core_device *vdev, bool test_mem,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_do_io_rw);
 
+static ssize_t vfio_pci_rom_read(struct vfio_pci_core_device *vdev,
+				 char __user *buf, size_t count, loff_t pos)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	bool rom_bar = pci_resource_start(pdev, PCI_ROM_RESOURCE);
+	size_t size, length = 0, done = 0;
+	void *data = NULL;
+	void __iomem *io;
+	ssize_t ret;
+
+	/* Serialize ROM decoding with power-state and other ROM accesses. */
+	down_write(&vdev->memory_lock);
+	if (rom_bar) {
+		io = pci_map_rom(pdev, &size);
+	} else {
+		io = ioremap(pdev->rom, pdev->romlen);
+		size = pdev->romlen;
+	}
+	if (!io) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	/* Buffer only ROM data, not unused space in a large ROM BAR. */
+	if (pos < size)
+		length = min(count, size - (size_t)pos);
+	if (length) {
+		if ((pci_resource_flags(pdev, PCI_ROM_RESOURCE) & IORESOURCE_MEM) &&
+		    !__vfio_pci_memory_enabled(vdev)) {
+			ret = -EIO;
+			goto out_unmap;
+		}
+		data = kvmalloc(length, GFP_KERNEL_ACCOUNT);
+		if (!data) {
+			ret = -ENOMEM;
+			goto out_unmap;
+		}
+	}
+
+	/*
+	 * Certain devices (e.g. Intel X710) don't support qword
+	 * access to the ROM bar. Otherwise PCI AER errors might be
+	 * triggered.
+	 *
+	 * Disable qword access to the ROM bar universally, which
+	 * worked reliably for years before qword access is enabled.
+	 */
+	while (done < length) {
+		if (length - done >= 4 && IS_ALIGNED(pos + done, 4)) {
+			u32 val = vfio_ioread32(io + pos + done);
+
+			memcpy(data + done, &val, sizeof(val));
+			done += sizeof(val);
+		} else if (length - done >= 2 && IS_ALIGNED(pos + done, 2)) {
+			u16 val = vfio_ioread16(io + pos + done);
+
+			memcpy(data + done, &val, sizeof(val));
+			done += sizeof(val);
+		} else {
+			((u8 *)data)[done] = vfio_ioread8(io + pos + done);
+			done++;
+		}
+	}
+	ret = count;
+
+out_unmap:
+	if (rom_bar)
+		pci_unmap_rom(pdev, io);
+	else
+		iounmap(io);
+out_unlock:
+	up_write(&vdev->memory_lock);
+	if (ret < 0)
+		goto out_free;
+
+	if (length && copy_to_user(buf, data, length)) {
+		ret = -EFAULT;
+		goto out_free;
+	}
+	for (done = length; done < count; done++) {
+		if (put_user((u8)0xff, buf + done)) {
+			ret = -EFAULT;
+			break;
+		}
+	}
+out_free:
+	kvfree(data);
+	return ret;
+}
+
 ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite)
 {
@@ -209,7 +301,6 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 	void __iomem *io;
 	struct resource *res = &vdev->pdev->resource[bar];
 	ssize_t done;
-	enum vfio_pci_io_width max_width = VFIO_PCI_IO_WIDTH_8;
 
 	if (pci_resource_start(pdev, bar))
 		end = pci_resource_len(pdev, bar);
@@ -224,57 +315,27 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 	count = min(count, (size_t)(end - pos));
 
 	if (bar == PCI_ROM_RESOURCE) {
-		/*
-		 * The ROM can fill less space than the BAR, so we start the
-		 * excluded range at the end of the actual ROM.  This makes
-		 * filling large ROM BARs much faster.
-		 */
-		if (pci_resource_start(pdev, bar)) {
-			io = pci_map_rom(pdev, &x_start);
-		} else {
-			io = ioremap(pdev->rom, pdev->romlen);
-			x_start = pdev->romlen;
-		}
-		if (!io)
-			return -ENOMEM;
-		x_end = end;
-
-		/*
-		 * Certain devices (e.g. Intel X710) don't support qword
-		 * access to the ROM bar. Otherwise PCI AER errors might be
-		 * triggered.
-		 *
-		 * Disable qword access to the ROM bar universally, which
-		 * worked reliably for years before qword access is enabled.
-		 */
-		max_width = VFIO_PCI_IO_WIDTH_4;
+		if (iswrite)
+			return -EINVAL;
+		done = vfio_pci_rom_read(vdev, buf, count, pos);
 	} else {
 		io = vfio_pci_core_get_iomap(vdev, bar);
-		if (IS_ERR(io)) {
-			done = PTR_ERR(io);
-			goto out;
+		if (IS_ERR(io))
+			return PTR_ERR(io);
+
+		if (bar == vdev->msix_bar) {
+			x_start = vdev->msix_offset;
+			x_end = vdev->msix_offset + vdev->msix_size;
 		}
-	}
 
-	if (bar == vdev->msix_bar) {
-		x_start = vdev->msix_offset;
-		x_end = vdev->msix_offset + vdev->msix_size;
+		done = vfio_pci_core_do_io_rw(vdev, res->flags & IORESOURCE_MEM,
+					      io, buf, pos, count, x_start, x_end,
+					      iswrite, VFIO_PCI_IO_WIDTH_8);
 	}
-
-	done = vfio_pci_core_do_io_rw(vdev, res->flags & IORESOURCE_MEM, io, buf, pos,
-				      count, x_start, x_end, iswrite, max_width);
 
 	if (done >= 0)
 		*ppos += done;
 
-	if (bar == PCI_ROM_RESOURCE) {
-		if (pci_resource_start(pdev, bar))
-			pci_unmap_rom(pdev, io);
-		else
-			iounmap(io);
-	}
-
-out:
 	return done;
 }
 
