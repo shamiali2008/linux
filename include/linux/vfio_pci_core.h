@@ -289,7 +289,8 @@ int vfio_pci_dma_buf_iommufd_map(struct dma_buf_attachment *attachment,
 
 int vfio_pci_core_runtime_suspend(struct vfio_pci_core_device *vdev);
 int vfio_pci_core_runtime_resume(struct vfio_pci_core_device *vdev);
-pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev);
+pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev,
+						pci_channel_state_t state);
 pci_ers_result_t vfio_pci_core_aer_slot_reset(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_aer_resume(struct vfio_pci_core_device *vdev);
 
@@ -322,7 +323,7 @@ static pci_ers_result_t name##_aer_err_detected(struct pci_dev *pdev,         \
 {                                                                             \
 	drv_type *drvdata = pci_get_drvdata(pdev);                            \
 									      \
-	return vfio_pci_core_aer_err_detected(&drvdata->member);              \
+	return vfio_pci_core_aer_err_detected(&drvdata->member, state);       \
 }
 
 #endif /* VFIO_PCI_CORE_H */

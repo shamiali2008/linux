@@ -347,7 +347,11 @@ static void vfio_pci_restore_config(struct vfio_pci_core_device *vdev)
 static int vfio_pci_power_blocked(struct vfio_pci_core_device *vdev,
 				  pci_power_t state)
 {
-	return -EIO;
+	lockdep_assert_held_write(&vdev->memory_lock);
+	if (state != PCI_D0 || !READ_ONCE(vdev->device_open))
+		return -EIO;
+	vdev->power_up_pending = true;
+	return 0;
 }
 
 static void vfio_pci_restore_dmabufs_blocked(struct vfio_pci_core_device *vdev)
@@ -410,10 +414,17 @@ static void vfio_pci_core_block_access(struct vfio_pci_core_device *vdev)
 	unsigned long flags;
 
 	lockdep_assert_held(&vdev->access_lock);
+	/*
+	 * Finish live PM restoration before blocked INTx handlers can mask the
+	 * device. Otherwise an old restore can undo their hardware mask.
+	 */
+	down_write(&vdev->memory_lock);
 	spin_lock_irqsave(&vdev->irqlock, flags);
 	rcu_assign_pointer(vdev->access_ops, &vfio_pci_blocked_ops);
 	spin_unlock_irqrestore(&vdev->irqlock, flags);
+	up_write(&vdev->memory_lock);
 
+	/* SRCU readers may need memory_lock to finish. */
 	synchronize_srcu(&vdev->access_srcu);
 }
 
@@ -756,6 +767,16 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 	u16 cmd;
 	u8 msix_pos;
 
+	if (vdev->pci_recovery_supported) {
+		if (pci_dev_is_disconnected(pdev))
+			return -ENODEV;
+		mutex_lock(&vdev->access_lock);
+		ret = vdev->pci_recovery_host_active ? -EBUSY : 0;
+		mutex_unlock(&vdev->access_lock);
+		if (ret)
+			return ret;
+	}
+
 	if (!vdev->disable_idle_d3) {
 		ret = pm_runtime_resume_and_get(&pdev->dev);
 		if (ret < 0)
@@ -999,6 +1020,10 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 			WRITE_ONCE(vdev->device_open, false);
 			vfio_pci_core_block_access(vdev);
 			WRITE_ONCE(vdev->pci_recovery_flags, 0);
+			/* Discard pending D0 before the next open. */
+			down_write(&vdev->memory_lock);
+			vdev->power_up_pending = false;
+			up_write(&vdev->memory_lock);
 		}
 	}
 
@@ -2660,17 +2685,142 @@ void vfio_pci_core_unregister_device(struct vfio_pci_core_device *vdev)
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_device);
 
-pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev)
+/*
+ * Save PCI_COMMAND, clear bus mastering and set the requested bits.
+ * Reject an all-ones read from an inaccessible device.
+ */
+static int
+vfio_pci_recovery_save_and_clear_master(struct vfio_pci_core_device *vdev, u16 set)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	u16 command;
+	int ret;
+
+	ret = pci_read_config_word(pdev, PCI_COMMAND, &vdev->pci_recovery_command);
+	if (ret)
+		return ret;
+	if (PCI_POSSIBLE_ERROR(vdev->pci_recovery_command))
+		return -EIO;
+
+	command = (vdev->pci_recovery_command & ~PCI_COMMAND_MASTER) | set;
+	ret = pci_write_config_word(pdev, PCI_COMMAND, command);
+	if (ret)
+		return ret;
+
+	vdev->pci_recovery_command_valid = true;
+	return 0;
+}
+
+pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev,
+						pci_channel_state_t state)
 {
 	struct vfio_pci_eventfd *eventfd;
+	pci_ers_result_t result = PCI_ERS_RESULT_CAN_RECOVER;
+	unsigned long irq_flags;
+	bool nested;
+	u32 flags;
+	int ret = 0;
 
+	if (!vdev->pci_recovery_supported)
+		goto out;
+
+	mutex_lock(&vdev->access_lock);
+	/*
+	 * Track host recovery even without userspace opt-in so open can reject
+	 * attempts while recovery is running.
+	 */
+	vdev->pci_recovery_host_active =
+		state != pci_channel_io_perm_failure;
+	if (!vdev->pci_recovery_enabled)
+		goto out_unlock;
+
+	/* Keep failed devices blocked until close. */
+	if (vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_FAILED) {
+		result = PCI_ERS_RESULT_NONE;
+		goto out_unlock;
+	}
+
+	if (!vdev->device_open) {
+		result = PCI_ERS_RESULT_NONE;
+		goto out_unlock;
+	}
+
+	vfio_pci_core_block_access(vdev);
+	/*
+	 * Keep the original command register for nested events. Recovery may
+	 * already have disabled bus mastering in the current value.
+	 */
+	nested = vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS;
+	if (!nested)
+		vdev->pci_recovery_command_valid = false;
+	vfio_pci_intx_recovery_start(vdev);
+	vfio_pci_zap_and_down_write_memory_lock(vdev);
+	/*
+	 * Hold irqlock while updating PCI_COMMAND to protect against the INTx
+	 * handler, which does not use access_srcu.
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	if (state == pci_channel_io_normal && vdev->pci_2_3 && !nested)
+		ret = vfio_pci_recovery_save_and_clear_master(vdev,
+							      PCI_COMMAND_INTX_DISABLE);
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+	vfio_pci_dma_buf_move(vdev, true);
+
+	/*
+	 * Advance the sequence unless recovery is already running. Write the
+	 * flags in one store so readers without the lock cannot see them briefly
+	 * cleared between the old and new values.
+	 */
+	if (nested) {
+		flags = vdev->pci_recovery_flags;
+	} else {
+		if (++vdev->pci_recovery_sequence == 0)
+			vdev->pci_recovery_sequence++;
+		flags = 0;
+	}
+
+	if (state == pci_channel_io_perm_failure) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   (flags | VFIO_PCI_RECOVERY_FAILED) &
+			   ~VFIO_PCI_RECOVERY_IN_PROGRESS);
+		vdev->pci_recovery_command_valid = false;
+		result = PCI_ERS_RESULT_DISCONNECT;
+		goto out_memory;
+	}
+
+	if (state == pci_channel_io_frozen) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   flags | VFIO_PCI_RECOVERY_IN_PROGRESS |
+			   VFIO_PCI_RECOVERY_FROZEN);
+		result = PCI_ERS_RESULT_NEED_RESET;
+		goto out_memory;
+	}
+
+	if (!ret && !vdev->pci_2_3 && !nested)
+		ret = vfio_pci_recovery_save_and_clear_master(vdev, 0);
+
+	if (ret) {
+		flags |= VFIO_PCI_RECOVERY_FAILED;
+		flags &= ~VFIO_PCI_RECOVERY_IN_PROGRESS;
+		result = PCI_ERS_RESULT_NONE;
+	} else {
+		flags |= VFIO_PCI_RECOVERY_IN_PROGRESS;
+	}
+	WRITE_ONCE(vdev->pci_recovery_flags, flags);
+
+out_memory:
+	up_write(&vdev->memory_lock);
+out_unlock:
+	mutex_unlock(&vdev->access_lock);
+
+out:
 	rcu_read_lock();
 	eventfd = rcu_dereference(vdev->err_trigger);
 	if (eventfd)
 		eventfd_signal(eventfd->ctx);
 	rcu_read_unlock();
 
-	return PCI_ERS_RESULT_CAN_RECOVER;
+	return result;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_err_detected);
 

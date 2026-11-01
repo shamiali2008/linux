@@ -247,7 +247,7 @@ static pci_ers_result_t vfio_pci_aer_err_detected(struct pci_dev *pdev,
 {
 	struct vfio_pci_core_device *vdev = pci_get_drvdata(pdev);
 
-	return vfio_pci_core_aer_err_detected(vdev);
+	return vfio_pci_core_aer_err_detected(vdev, state);
 }
 
 static pci_ers_result_t vfio_pci_aer_slot_reset(struct pci_dev *pdev)
