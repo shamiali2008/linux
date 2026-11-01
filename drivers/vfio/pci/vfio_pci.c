@@ -257,6 +257,13 @@ static pci_ers_result_t vfio_pci_aer_slot_reset(struct pci_dev *pdev)
 	return vfio_pci_core_aer_slot_reset(vdev);
 }
 
+static void vfio_pci_aer_resume(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = pci_get_drvdata(pdev);
+
+	vfio_pci_core_aer_resume(vdev);
+}
+
 static const struct pci_error_handlers vfio_pci_legacy_err_handlers = {
 	.error_detected = vfio_pci_aer_err_detected,
 };
@@ -264,6 +271,7 @@ static const struct pci_error_handlers vfio_pci_legacy_err_handlers = {
 static const struct pci_error_handlers vfio_pci_err_handlers = {
 	.error_detected = vfio_pci_aer_err_detected,
 	.slot_reset = vfio_pci_aer_slot_reset,
+	.resume = vfio_pci_aer_resume,
 };
 
 static struct pci_driver vfio_pci_driver = {

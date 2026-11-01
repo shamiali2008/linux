@@ -147,6 +147,8 @@ struct vfio_pci_core_device {
 	bool			sriov_active;
 	struct pci_saved_state	*pci_saved_state;
 	struct pci_saved_state	*pm_save;
+	/* Deferred D0 request, protected by memory_lock. */
+	bool			power_up_pending;
 	int			ioeventfds_nr;
 	struct vfio_pci_eventfd __rcu *err_trigger;
 	struct vfio_pci_eventfd __rcu *req_trigger;
@@ -289,6 +291,7 @@ int vfio_pci_core_runtime_suspend(struct vfio_pci_core_device *vdev);
 int vfio_pci_core_runtime_resume(struct vfio_pci_core_device *vdev);
 pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev);
 pci_ers_result_t vfio_pci_core_aer_slot_reset(struct vfio_pci_core_device *vdev);
+void vfio_pci_core_aer_resume(struct vfio_pci_core_device *vdev);
 
 /*
  * Per-driver PM/AER trampolines. driver_data points to the driver's private

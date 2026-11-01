@@ -515,6 +515,13 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 	return __vfio_pci_set_power_state(vdev, state, pci_set_power_state);
 }
 
+static int
+vfio_pci_set_power_state_locked(struct vfio_pci_core_device *vdev,
+				pci_power_t state)
+{
+	return __vfio_pci_set_power_state(vdev, state, pci_set_power_state_locked);
+}
+
 /* Avoid waiting for pci_bus_sem under locks needed by PCI recovery. */
 int vfio_pci_try_set_power_state(struct vfio_pci_core_device *vdev,
 				 pci_power_t state)
@@ -2749,6 +2756,86 @@ out_failed:
 	return PCI_ERS_RESULT_NONE;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_slot_reset);
+
+void vfio_pci_core_aer_resume(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	unsigned long irq_flags;
+	bool notify_intx = false;
+	bool power_up;
+	u32 flags;
+	int ret = 0;
+
+	mutex_lock(&vdev->access_lock);
+	vdev->pci_recovery_host_active = false;
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_IN_PROGRESS))
+		goto out_unlock;
+
+	/*
+	 * Match IRQ configuration's lock order and keep D0 requests out until
+	 * live ops are installed, so no deferred request can be left behind.
+	 */
+	mutex_lock(&vdev->igate);
+	down_write(&vdev->memory_lock);
+	/*
+	 * Complete a deferred D0 request before restoring PCI_COMMAND.
+	 * After a reset, slot_reset() has already put the device in D0.
+	 */
+	power_up = vdev->power_up_pending;
+	vdev->power_up_pending = false;
+	if (power_up && !(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_RESET)) {
+		ret = vfio_pci_set_power_state_locked(vdev, PCI_D0);
+		if (ret)
+			goto out_memory;
+	}
+
+	/*
+	 * Hold irqlock while updating PCI_COMMAND, as the INTx handler does.
+	 * Keep masked INTx disabled until vfio_pci_intx_recovery_finish().
+	 */
+	spin_lock_irqsave(&vdev->irqlock, irq_flags);
+	if (!(vdev->pci_recovery_flags & VFIO_PCI_RECOVERY_RESET) &&
+	    vdev->pci_recovery_command_valid) {
+		u16 cmd = vdev->pci_recovery_command;
+
+		cmd = vfio_pci_intx_recovery_update_command(vdev, cmd);
+		ret = pci_write_config_word(pdev, PCI_COMMAND, cmd);
+	}
+	spin_unlock_irqrestore(&vdev->irqlock, irq_flags);
+	if (ret)
+		goto out_memory;
+
+	/*
+	 * Restoring saved state may leave ROM decoding enabled. Disable it
+	 * before allowing access to shared decoders.
+	 */
+	if (pci_resource_start(pdev, PCI_ROM_RESOURCE) &&
+	    !(pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_ENABLE))
+		pci_disable_rom(pdev);
+
+	/* Recovery restores mappings while ordinary access still uses stubs. */
+	if (__vfio_pci_memory_enabled(vdev))
+		vfio_pci_dma_buf_restore(vdev);
+
+out_memory:
+	vdev->pci_recovery_command_valid = false;
+	flags = vdev->pci_recovery_flags & ~VFIO_PCI_RECOVERY_IN_PROGRESS;
+	if (ret) {
+		WRITE_ONCE(vdev->pci_recovery_flags,
+			   flags | VFIO_PCI_RECOVERY_FAILED);
+	} else {
+		WRITE_ONCE(vdev->pci_recovery_flags, flags);
+		notify_intx = vfio_pci_intx_recovery_finish(vdev);
+	}
+	up_write(&vdev->memory_lock);
+	if (notify_intx)
+		vfio_pci_intx_recovery_signal(vdev);
+	mutex_unlock(&vdev->igate);
+
+out_unlock:
+	mutex_unlock(&vdev->access_lock);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_aer_resume);
 
 static int vfio_pci_sriov_configure_live(struct vfio_pci_core_device *vdev,
 					 int nr_virtfn)
