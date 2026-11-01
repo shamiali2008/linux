@@ -160,7 +160,7 @@ struct vfio_pci_core_device {
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
 	struct srcu_struct	access_srcu;
-	/* Updated under access_lock. */
+	/* Updated under access_lock and irqlock. */
 	const struct vfio_pci_access_ops __rcu *access_ops;
 	/* Set after open completes, cleared before close tears down state. */
 	bool			device_open;

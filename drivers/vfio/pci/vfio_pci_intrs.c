@@ -29,6 +29,8 @@ struct vfio_pci_irq_ctx {
 	struct virqfd			*mask;
 	char				*name;
 	bool				masked;
+	bool				recovery_masked;
+	bool				unmask_pending;
 	struct irq_bypass_producer	producer;
 };
 
@@ -126,6 +128,10 @@ static bool __vfio_pci_intx_mask(struct vfio_pci_core_device *vdev)
 	if (WARN_ON_ONCE(!ctx))
 		goto out_unlock;
 
+	/* An explicit mask cancels any unmask request saved during recovery. */
+	ctx->recovery_masked = false;
+	ctx->unmask_pending = false;
+
 	if (!ctx->masked) {
 		/*
 		 * Can't use check_and_mask here because we always want to
@@ -162,16 +168,13 @@ bool vfio_pci_intx_mask(struct vfio_pci_core_device *vdev)
  * a signal is necessary, which can then be handled via a work queue
  * or directly depending on the caller.
  */
-static int vfio_pci_intx_unmask_handler(void *opaque, void *data)
+int vfio_pci_intx_unmask_live(struct vfio_pci_core_device *vdev,
+			      struct vfio_pci_irq_ctx *ctx)
 {
-	struct vfio_pci_core_device *vdev = opaque;
 	struct pci_dev *pdev = vdev->pdev;
-	struct vfio_pci_irq_ctx *ctx = data;
-	unsigned long flags;
 	int ret = 0;
 
-	spin_lock_irqsave(&vdev->irqlock, flags);
-
+	lockdep_assert_held(&vdev->irqlock);
 	/*
 	 * Unmasking comes from ioctl or config, so again, have the
 	 * physical bit follow the virtual even when not using INTx.
@@ -179,8 +182,11 @@ static int vfio_pci_intx_unmask_handler(void *opaque, void *data)
 	if (unlikely(!is_intx(vdev))) {
 		if (vdev->pci_2_3)
 			pci_intx(pdev, 1);
-		goto out_unlock;
+		goto out;
 	}
+
+	ctx->unmask_pending = false;
+	ctx->recovery_masked = false;
 
 	if (ctx->masked && !vdev->virq_disabled) {
 		/*
@@ -197,9 +203,28 @@ static int vfio_pci_intx_unmask_handler(void *opaque, void *data)
 		ctx->masked = (ret > 0);
 	}
 
-out_unlock:
-	spin_unlock_irqrestore(&vdev->irqlock, flags);
+out:
+	return ret;
+}
 
+int vfio_pci_intx_unmask_blocked(struct vfio_pci_core_device *vdev,
+				 struct vfio_pci_irq_ctx *ctx)
+{
+	lockdep_assert_held(&vdev->irqlock);
+	if (is_intx(vdev))
+		ctx->unmask_pending = true;
+	return 0;
+}
+
+static int vfio_pci_intx_unmask_handler(void *opaque, void *data)
+{
+	struct vfio_pci_core_device *vdev = opaque;
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&vdev->irqlock, flags);
+	ret = vfio_pci_access_ops(vdev)->intx_unmask(vdev, data);
+	spin_unlock_irqrestore(&vdev->irqlock, flags);
 	return ret;
 }
 
@@ -220,31 +245,149 @@ void vfio_pci_intx_unmask(struct vfio_pci_core_device *vdev)
 	mutex_unlock(&vdev->igate);
 }
 
+/*
+ * Recovery always masks INTx and remembers whether to unmask it afterward.
+ * The interrupt handler masks INTx only if this device has a pending
+ * interrupt, since another device may share the line.
+ */
+static bool vfio_pci_intx_mask_for_recovery(struct vfio_pci_core_device *vdev,
+					    struct vfio_pci_irq_ctx *ctx,
+					    bool quiesce)
+{
+	lockdep_assert_held(&vdev->irqlock);
+
+	if (ctx->masked)
+		return false;
+
+	if (!vdev->pci_2_3)
+		disable_irq_nosync(vdev->pdev->irq);
+	else if (quiesce)
+		pci_intx(vdev->pdev, 0);
+	else if (!pci_check_and_mask_intx(vdev->pdev))
+		return false;
+
+	ctx->masked = true;
+	if (quiesce)
+		ctx->recovery_masked = true;
+	return true;
+}
+
+irqreturn_t vfio_pci_intx_handle(struct vfio_pci_core_device *vdev,
+				 struct vfio_pci_irq_ctx *ctx)
+{
+	lockdep_assert_held(&vdev->irqlock);
+	if (!vdev->pci_2_3) {
+		disable_irq_nosync(vdev->pdev->irq);
+		ctx->masked = true;
+		return IRQ_HANDLED;
+	}
+	if (!ctx->masked && pci_check_and_mask_intx(vdev->pdev)) {
+		ctx->masked = true;
+		return IRQ_HANDLED;
+	}
+	return IRQ_NONE;
+}
+
+irqreturn_t vfio_pci_intx_handle_blocked(struct vfio_pci_core_device *vdev,
+					 struct vfio_pci_irq_ctx *ctx)
+{
+	lockdep_assert_held(&vdev->irqlock);
+	/* A shared interrupt line still needs pending INTx to be masked. */
+	if (vfio_pci_intx_mask_for_recovery(vdev, ctx, false) ||
+	    (ctx->masked && !vdev->pci_2_3))
+		return IRQ_HANDLED;
+	return IRQ_NONE;
+}
+
 static irqreturn_t vfio_intx_handler(int irq, void *dev_id)
 {
 	struct vfio_pci_irq_ctx *ctx = dev_id;
 	struct vfio_pci_core_device *vdev = ctx->vdev;
 	unsigned long flags;
-	int ret = IRQ_NONE;
+	irqreturn_t ret;
 
 	spin_lock_irqsave(&vdev->irqlock, flags);
-
-	if (!vdev->pci_2_3) {
-		disable_irq_nosync(vdev->pdev->irq);
-		ctx->masked = true;
-		ret = IRQ_HANDLED;
-	} else if (!ctx->masked &&  /* may be shared */
-		   pci_check_and_mask_intx(vdev->pdev)) {
-		ctx->masked = true;
-		ret = IRQ_HANDLED;
-	}
-
+	ret = vfio_pci_access_ops(vdev)->intx_handler(vdev, ctx);
 	spin_unlock_irqrestore(&vdev->irqlock, flags);
 
 	if (ret == IRQ_HANDLED)
 		vfio_send_intx_eventfd(vdev, ctx);
-
 	return ret;
+}
+
+void vfio_pci_intx_recovery_start(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_irq_ctx *ctx;
+	unsigned long flags;
+
+	lockdep_assert_held(&vdev->access_lock);
+
+	spin_lock_irqsave(&vdev->irqlock, flags);
+	if (!is_intx(vdev))
+		goto out_unlock;
+
+	ctx = vfio_irq_ctx_get(vdev, 0);
+	if (WARN_ON_ONCE(!ctx))
+		goto out_unlock;
+
+	vfio_pci_intx_mask_for_recovery(vdev, ctx, true);
+
+out_unlock:
+	spin_unlock_irqrestore(&vdev->irqlock, flags);
+}
+
+/* Preserve the current INTx mask when restoring PCI_COMMAND. */
+u16 vfio_pci_intx_recovery_update_command(struct vfio_pci_core_device *vdev,
+					  u16 command)
+{
+	struct vfio_pci_irq_ctx *ctx;
+
+	lockdep_assert_held(&vdev->irqlock);
+
+	if (!vdev->pci_2_3 || !is_intx(vdev))
+		return command;
+
+	ctx = vfio_irq_ctx_get(vdev, 0);
+	if (ctx && ctx->masked)
+		command |= PCI_COMMAND_INTX_DISABLE;
+
+	return command;
+}
+
+/*
+ * Restore INTx and allow ordinary access under the same lock. An unmask
+ * request must either be replayed here or reach the live op afterward.
+ */
+bool vfio_pci_intx_recovery_finish(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_irq_ctx *ctx = NULL;
+	unsigned long flags;
+	int ret = 0;
+
+	lockdep_assert_held(&vdev->access_lock);
+	lockdep_assert_held(&vdev->igate);
+	lockdep_assert_held_write(&vdev->memory_lock);
+	spin_lock_irqsave(&vdev->irqlock, flags);
+	if (!is_intx(vdev))
+		goto out_restore;
+
+	ctx = vfio_irq_ctx_get(vdev, 0);
+	if (WARN_ON_ONCE(!ctx))
+		goto out_restore;
+
+	if (ctx->recovery_masked || ctx->unmask_pending)
+		ret = vfio_pci_intx_unmask_live(vdev, ctx);
+
+out_restore:
+	vfio_pci_restore_access(vdev);
+	spin_unlock_irqrestore(&vdev->irqlock, flags);
+	return ret > 0;
+}
+
+void vfio_pci_intx_recovery_signal(struct vfio_pci_core_device *vdev)
+{
+	lockdep_assert_held(&vdev->igate);
+	vfio_send_intx_eventfd(vdev, vfio_irq_ctx_get(vdev, 0));
 }
 
 static int vfio_intx_enable(struct vfio_pci_core_device *vdev,

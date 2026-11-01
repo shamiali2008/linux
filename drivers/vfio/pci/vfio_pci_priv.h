@@ -3,6 +3,7 @@
 #define VFIO_PCI_PRIV_H
 
 #include <linux/vfio_pci_core.h>
+#include <linux/irqreturn.h>
 
 /* Special capability IDs predefined access */
 #define PCI_CAP_ID_INVALID		0xFF	/* default raw access */
@@ -25,6 +26,11 @@ struct vfio_pci_ioeventfd {
 
 bool vfio_pci_intx_mask(struct vfio_pci_core_device *vdev);
 void vfio_pci_intx_unmask(struct vfio_pci_core_device *vdev);
+void vfio_pci_intx_recovery_start(struct vfio_pci_core_device *vdev);
+bool vfio_pci_intx_recovery_finish(struct vfio_pci_core_device *vdev);
+void vfio_pci_intx_recovery_signal(struct vfio_pci_core_device *vdev);
+u16 vfio_pci_intx_recovery_update_command(struct vfio_pci_core_device *vdev,
+					  u16 command);
 
 int vfio_pci_eventfd_replace_locked(struct vfio_pci_core_device *vdev,
 				    struct vfio_pci_eventfd __rcu **peventfd,
@@ -84,6 +90,8 @@ typedef long (*vfio_pci_access_fn)(struct vfio_pci_core_device *vdev,
 long vfio_pci_core_access(struct vfio_pci_core_device *vdev,
 			  vfio_pci_access_fn fn, void *data);
 
+struct vfio_pci_irq_ctx;
+
 struct vfio_pci_access_ops {
 	/* Select and call within SRCU. The callback receives kernel buffers. */
 	long (*execute)(struct vfio_pci_core_device *vdev,
@@ -92,10 +100,24 @@ struct vfio_pci_access_ops {
 	int (*set_power_state)(struct vfio_pci_core_device *vdev, pci_power_t state);
 	/* Caller holds memory_lock. */
 	void (*restore_dmabufs)(struct vfio_pci_core_device *vdev);
+	/* Select and call both INTx methods while holding irqlock. */
+	irqreturn_t (*intx_handler)(struct vfio_pci_core_device *vdev,
+				    struct vfio_pci_irq_ctx *ctx);
+	int (*intx_unmask)(struct vfio_pci_core_device *vdev,
+			   struct vfio_pci_irq_ctx *ctx);
 };
 
 const struct vfio_pci_access_ops *
 vfio_pci_access_ops(struct vfio_pci_core_device *vdev);
+void vfio_pci_restore_access(struct vfio_pci_core_device *vdev);
+irqreturn_t vfio_pci_intx_handle(struct vfio_pci_core_device *vdev,
+				 struct vfio_pci_irq_ctx *ctx);
+irqreturn_t vfio_pci_intx_handle_blocked(struct vfio_pci_core_device *vdev,
+					 struct vfio_pci_irq_ctx *ctx);
+int vfio_pci_intx_unmask_live(struct vfio_pci_core_device *vdev,
+			      struct vfio_pci_irq_ctx *ctx);
+int vfio_pci_intx_unmask_blocked(struct vfio_pci_core_device *vdev,
+				 struct vfio_pci_irq_ctx *ctx);
 
 #ifdef CONFIG_VFIO_PCI_IGD
 bool vfio_pci_is_intel_display(struct pci_dev *pdev);

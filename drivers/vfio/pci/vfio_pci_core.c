@@ -338,12 +338,16 @@ static const struct vfio_pci_access_ops vfio_pci_live_ops = {
 	.execute = vfio_pci_access_live,
 	.set_power_state = vfio_pci_try_set_power_state,
 	.restore_dmabufs = vfio_pci_dma_buf_restore,
+	.intx_handler = vfio_pci_intx_handle,
+	.intx_unmask = vfio_pci_intx_unmask_live,
 };
 
 static const struct vfio_pci_access_ops vfio_pci_blocked_ops = {
 	.execute = vfio_pci_access_blocked,
 	.set_power_state = vfio_pci_power_blocked,
 	.restore_dmabufs = vfio_pci_restore_dmabufs_blocked,
+	.intx_handler = vfio_pci_intx_handle_blocked,
+	.intx_unmask = vfio_pci_intx_unmask_blocked,
 };
 
 /*
@@ -362,10 +366,25 @@ vfio_pci_access_ops(struct vfio_pci_core_device *vdev)
 /* Block new operations and drain ordinary accesses before teardown or recovery. */
 static void vfio_pci_core_block_access(struct vfio_pci_core_device *vdev)
 {
+	unsigned long flags;
+
 	lockdep_assert_held(&vdev->access_lock);
+	spin_lock_irqsave(&vdev->irqlock, flags);
 	rcu_assign_pointer(vdev->access_ops, &vfio_pci_blocked_ops);
+	spin_unlock_irqrestore(&vdev->irqlock, flags);
 
 	synchronize_srcu(&vdev->access_srcu);
+}
+
+/* Caller finishes internal restoration before allowing ordinary access. */
+void vfio_pci_restore_access(struct vfio_pci_core_device *vdev)
+{
+	lockdep_assert_held(&vdev->access_lock);
+	lockdep_assert_held(&vdev->irqlock);
+	if (vdev->device_open &&
+	    !(vdev->pci_recovery_flags &
+	      (VFIO_PCI_RECOVERY_IN_PROGRESS | VFIO_PCI_RECOVERY_FAILED)))
+		rcu_assign_pointer(vdev->access_ops, &vfio_pci_live_ops);
 }
 
 long vfio_pci_core_access(struct vfio_pci_core_device *vdev,
@@ -965,13 +984,17 @@ void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
 	}
 
 	if (vdev->pci_recovery_supported) {
+		unsigned long flags;
+
 		guard(mutex)(&vdev->access_lock);
 		WRITE_ONCE(vdev->pci_recovery_flags, 0);
 		vdev->pci_recovery_sequence = 0;
 		vdev->pci_recovery_command_valid = false;
 		WRITE_ONCE(vdev->pci_recovery_enabled, false);
 		WRITE_ONCE(vdev->device_open, true);
+		spin_lock_irqsave(&vdev->irqlock, flags);
 		rcu_assign_pointer(vdev->access_ops, &vfio_pci_live_ops);
+		spin_unlock_irqrestore(&vdev->irqlock, flags);
 	}
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_finish_enable);
