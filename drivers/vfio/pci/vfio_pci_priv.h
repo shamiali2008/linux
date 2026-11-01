@@ -98,6 +98,8 @@ struct vfio_pci_access_ops {
 			vfio_pci_access_fn fn, void *data);
 	/* Caller holds memory_lock. */
 	int (*set_power_state)(struct vfio_pci_core_device *vdev, pci_power_t state);
+	/* Used by PM restoration while the device is open. */
+	void (*restore_config)(struct vfio_pci_core_device *vdev);
 	/* Caller holds memory_lock. */
 	void (*restore_dmabufs)(struct vfio_pci_core_device *vdev);
 	/* Caller holds the PCI device lock. The device need not be open. */

@@ -288,6 +288,7 @@ int vfio_pci_dma_buf_iommufd_map(struct dma_buf_attachment *attachment,
 int vfio_pci_core_runtime_suspend(struct vfio_pci_core_device *vdev);
 int vfio_pci_core_runtime_resume(struct vfio_pci_core_device *vdev);
 pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev);
+pci_ers_result_t vfio_pci_core_aer_slot_reset(struct vfio_pci_core_device *vdev);
 
 /*
  * Per-driver PM/AER trampolines. driver_data points to the driver's private

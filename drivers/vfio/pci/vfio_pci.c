@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <xen/xen.h>
 
 #include "vfio_pci_priv.h"
 
@@ -249,8 +250,20 @@ static pci_ers_result_t vfio_pci_aer_err_detected(struct pci_dev *pdev,
 	return vfio_pci_core_aer_err_detected(vdev);
 }
 
+static pci_ers_result_t vfio_pci_aer_slot_reset(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = pci_get_drvdata(pdev);
+
+	return vfio_pci_core_aer_slot_reset(vdev);
+}
+
+static const struct pci_error_handlers vfio_pci_legacy_err_handlers = {
+	.error_detected = vfio_pci_aer_err_detected,
+};
+
 static const struct pci_error_handlers vfio_pci_err_handlers = {
 	.error_detected = vfio_pci_aer_err_detected,
+	.slot_reset = vfio_pci_aer_slot_reset,
 };
 
 static struct pci_driver vfio_pci_driver = {
@@ -308,6 +321,10 @@ static void __init vfio_pci_fill_ids(void)
 static int __init vfio_pci_init(void)
 {
 	int ret;
+
+	/* Xen PV and EEH check for callbacks. Keep the original table. */
+	if (xen_pv_domain() || IS_ENABLED(CONFIG_EEH))
+		vfio_pci_driver.err_handler = &vfio_pci_legacy_err_handlers;
 
 	/* Register and scan for devices */
 	ret = pci_register_driver(&vfio_pci_driver);
