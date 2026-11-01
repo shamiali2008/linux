@@ -98,6 +98,11 @@ static inline int vfio_pci_core_get_dmabuf_phys(
 }
 #endif
 
+#define VFIO_PCI_RECOVERY_IN_PROGRESS	BIT(0)
+#define VFIO_PCI_RECOVERY_FROZEN	BIT(1)
+#define VFIO_PCI_RECOVERY_RESET		BIT(2)
+#define VFIO_PCI_RECOVERY_FAILED	BIT(3)
+
 struct vfio_pci_access_ops;
 
 struct vfio_pci_core_device {
@@ -159,7 +164,18 @@ struct vfio_pci_core_device {
 	const struct vfio_pci_access_ops __rcu *access_ops;
 	/* Set after open completes, cleared before close tears down state. */
 	bool			device_open;
-	struct mutex		access_lock;	/* protects changes to access ops and flags */
+	struct mutex		access_lock;	/* protects access and recovery state */
+	u32			pci_recovery_flags;
+	u64			pci_recovery_sequence;
+	/* Saved PCI_COMMAND, valid when pci_recovery_command_valid is set. */
+	u16			pci_recovery_command;
+	bool			pci_recovery_enabled;
+	bool			pci_recovery_command_valid;
+	/*
+	 * Host recovery is still running. Protected by access_lock and kept across
+	 * close, unlike recovery status for the current open.
+	 */
+	bool			pci_recovery_host_active;
 	struct list_head	dmabufs;
 };
 
