@@ -100,6 +100,10 @@ struct vfio_pci_access_ops {
 	int (*set_power_state)(struct vfio_pci_core_device *vdev, pci_power_t state);
 	/* Caller holds memory_lock. */
 	void (*restore_dmabufs)(struct vfio_pci_core_device *vdev);
+	/* Caller holds the PCI device lock. The device need not be open. */
+	int (*sriov_configure)(struct vfio_pci_core_device *vdev, int nr_virtfn);
+	/* Caller holds memory_lock for this member of the reset set. */
+	int (*prepare_hot_reset)(struct vfio_pci_core_device *vdev);
 	/* Select and call both INTx methods while holding irqlock. */
 	irqreturn_t (*intx_handler)(struct vfio_pci_core_device *vdev,
 				    struct vfio_pci_irq_ctx *ctx);

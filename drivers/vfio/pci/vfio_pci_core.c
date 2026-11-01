@@ -312,6 +312,11 @@ static void vfio_pci_probe_power_state(struct vfio_pci_core_device *vdev)
 	vdev->needs_pm_restore = !(pmcsr & PCI_PM_CTRL_NO_SOFT_RESET);
 }
 
+static int vfio_pci_sriov_configure_live(struct vfio_pci_core_device *vdev,
+					 int nr_virtfn);
+static int vfio_pci_prepare_hot_reset(struct vfio_pci_core_device *vdev);
+static int vfio_pci_prepare_hot_reset_blocked(struct vfio_pci_core_device *vdev);
+
 static long vfio_pci_access_live(struct vfio_pci_core_device *vdev,
 				 vfio_pci_access_fn fn, void *data)
 {
@@ -334,10 +339,21 @@ static void vfio_pci_restore_dmabufs_blocked(struct vfio_pci_core_device *vdev)
 {
 }
 
+static int vfio_pci_sriov_configure_blocked(struct vfio_pci_core_device *vdev,
+					    int nr_virtfn)
+{
+	/* SR-IOV can be configured without an open VFIO device. */
+	if (!READ_ONCE(vdev->device_open))
+		return vfio_pci_sriov_configure_live(vdev, nr_virtfn);
+	return -EIO;
+}
+
 static const struct vfio_pci_access_ops vfio_pci_live_ops = {
 	.execute = vfio_pci_access_live,
 	.set_power_state = vfio_pci_try_set_power_state,
 	.restore_dmabufs = vfio_pci_dma_buf_restore,
+	.sriov_configure = vfio_pci_sriov_configure_live,
+	.prepare_hot_reset = vfio_pci_prepare_hot_reset,
 	.intx_handler = vfio_pci_intx_handle,
 	.intx_unmask = vfio_pci_intx_unmask_live,
 };
@@ -346,6 +362,8 @@ static const struct vfio_pci_access_ops vfio_pci_blocked_ops = {
 	.execute = vfio_pci_access_blocked,
 	.set_power_state = vfio_pci_power_blocked,
 	.restore_dmabufs = vfio_pci_restore_dmabufs_blocked,
+	.sriov_configure = vfio_pci_sriov_configure_blocked,
+	.prepare_hot_reset = vfio_pci_prepare_hot_reset_blocked,
 	.intx_handler = vfio_pci_intx_handle_blocked,
 	.intx_unmask = vfio_pci_intx_unmask_blocked,
 };
@@ -2594,7 +2612,7 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_register_device);
 
 void vfio_pci_core_unregister_device(struct vfio_pci_core_device *vdev)
 {
-	vfio_pci_core_sriov_configure(vdev, 0);
+	vfio_pci_sriov_configure_live(vdev, 0);
 
 	vfio_unregister_group_dev(&vdev->vdev);
 
@@ -2622,8 +2640,8 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vde
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_aer_err_detected);
 
-int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
-				  int nr_virtfn)
+static int vfio_pci_sriov_configure_live(struct vfio_pci_core_device *vdev,
+					 int nr_virtfn)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	int ret = 0;
@@ -2694,6 +2712,13 @@ out_del:
 out_unlock:
 	mutex_unlock(&vfio_pci_sriov_pfs_mutex);
 	return ret;
+}
+
+int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
+				  int nr_virtfn)
+{
+	device_lock_assert(&vdev->pdev->dev);
+	return vfio_pci_access_ops(vdev)->sriov_configure(vdev, nr_virtfn);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 
@@ -2776,6 +2801,23 @@ unwind:
 	return ret;
 }
 
+static int vfio_pci_prepare_hot_reset(struct vfio_pci_core_device *vdev)
+{
+	lockdep_assert_held_write(&vdev->memory_lock);
+	vfio_pci_dma_buf_move(vdev, true);
+	vfio_pci_zap_bars(vdev);
+	return 0;
+}
+
+static int vfio_pci_prepare_hot_reset_blocked(struct vfio_pci_core_device *vdev)
+{
+	/* Unopened and failed devices must not prevent a shared reset. */
+	if (READ_ONCE(vdev->device_open) &&
+	    !(READ_ONCE(vdev->pci_recovery_flags) & VFIO_PCI_RECOVERY_FAILED))
+		return -EBUSY;
+	return vfio_pci_prepare_hot_reset(vdev);
+}
+
 static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 				      struct vfio_pci_group_info *groups,
 				      struct iommufd_ctx *iommufd_ctx)
@@ -2849,8 +2891,11 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 			break;
 		}
 
-		vfio_pci_dma_buf_move(vdev, true);
-		vfio_pci_zap_bars(vdev);
+		ret = vfio_pci_access_ops(vdev)->prepare_hot_reset(vdev);
+		if (ret) {
+			up_write(&vdev->memory_lock);
+			break;
+		}
 	}
 
 	if (!list_entry_is_head(vdev,
