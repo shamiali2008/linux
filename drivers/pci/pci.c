@@ -1655,6 +1655,43 @@ int pci_set_power_state_locked(struct pci_dev *dev, pci_power_t state)
 }
 EXPORT_SYMBOL(pci_set_power_state_locked);
 
+/**
+ * pci_try_set_power_state - Set power state without waiting for the bus lock
+ * @dev: PCI device to handle
+ * @state: Target PCI power state
+ *
+ * Like pci_set_power_state(), but return -EAGAIN without changing the power
+ * state if the bus lock cannot be acquired immediately. The transition
+ * itself can sleep.
+ *
+ * Callers already holding the bus read lock must use
+ * pci_set_power_state_locked().
+ */
+int pci_try_set_power_state(struct pci_dev *dev, pci_power_t state)
+{
+	int ret;
+
+	if (state > PCI_D3cold)
+		state = PCI_D3cold;
+	else if (state < PCI_D0)
+		state = PCI_D0;
+	else if ((state == PCI_D1 || state == PCI_D2) && pci_no_d1d2(dev))
+		return 0;
+
+	if (dev->current_state == state)
+		return 0;
+	if (state >= PCI_D3hot && (dev->dev_flags & PCI_DEV_FLAGS_NO_D3))
+		return 0;
+
+	if (!down_read_trylock(&pci_bus_sem))
+		return -EAGAIN;
+	ret = pci_set_power_state_locked(dev, state);
+	up_read(&pci_bus_sem);
+
+	return ret;
+}
+EXPORT_SYMBOL(pci_try_set_power_state);
+
 #define PCI_EXP_SAVE_REGS	7
 
 static struct pci_cap_saved_state *_pci_find_saved_cap(struct pci_dev *pci_dev,
