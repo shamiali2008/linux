@@ -1558,7 +1558,11 @@ struct vfio_device_feature_zpci_err {
 /*
  * Report host PCI error recovery state for this device.
  *
- * Userspace must probe the feature on each device before enabling it.
+ * Support is limited to PCIe endpoints on a Root Port or Downstream Port
+ * subordinate bus, using native PCI error recovery. Direct RCiEP, EEH, Xen
+ * PV, s390 and CXL memory recovery are not supported. Functions with
+ * VPD redirected to function zero, and Intel Ethernet function zero
+ * devices with VPD are excluded. Userspace must probe each device.
  *
  * VFIO_DEVICE_FEATURE_SET with a valid eventfd enables recovery for this
  * open and requests notifications when each event starts and ends. SET

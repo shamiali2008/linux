@@ -126,10 +126,70 @@ static int vfio_pci_open_device(struct vfio_device *core_vdev)
 	return 0;
 }
 
+static bool vfio_pci_supports_recovery(struct pci_dev *pdev)
+{
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+
+	/*
+	 * Looking up function zero for VPD takes pci_bus_sem inside access_srcu.
+	 * Recovery holds the bus read lock while waiting for these SRCU readers.
+	 * A queued bus writer can leave both paths waiting for each other.
+	 */
+	if (pdev->dev_flags & PCI_DEV_FLAGS_VPD_REF_F0)
+		return false;
+
+	/*
+	 * quirk_f0_vpd_link() can redirect sibling VPD accesses to these devices
+	 * without checking whether recovery has blocked function zero. Exclude
+	 * them even if no redirecting sibling is present at probe.
+	 */
+	if (!PCI_FUNC(pdev->devfn) && pdev->vpd.cap &&
+	    pdev->vendor == PCI_VENDOR_ID_INTEL &&
+	    (pdev->class >> 8) == PCI_CLASS_NETWORK_ETHERNET)
+		return false;
+
+	/*
+	 * EEH and Xen PV can call recovery without the required bus locking.
+	 * s390 recovery can omit completion callbacks.
+	 */
+	if (IS_ENABLED(CONFIG_S390) || IS_ENABLED(CONFIG_EEH) ||
+	    xen_pv_domain())
+		return false;
+
+	/*
+	 * Recovery power helpers require pci_bus_sem held for reading.
+	 * The native recovery walk holds it on a port's subordinate bus.
+	 * Direct RCiEP recovery does not use that walk.
+	 */
+	if (!pci_is_pcie(pdev))
+		return false;
+
+	if (pci_pcie_type(pdev) != PCI_EXP_TYPE_ENDPOINT &&
+	    pci_pcie_type(pdev) != PCI_EXP_TYPE_LEG_END)
+		return false;
+
+	if (!bridge || !pci_is_pcie(bridge))
+		return false;
+
+	if (pci_pcie_type(bridge) != PCI_EXP_TYPE_ROOT_PORT &&
+	    pci_pcie_type(bridge) != PCI_EXP_TYPE_DOWNSTREAM)
+		return false;
+
+	if (pdev->bus != bridge->subordinate)
+		return false;
+
+	/* CXL RCH recovery can omit completion callbacks. */
+	if ((pdev->class >> 8) == PCI_CLASS_MEMORY_CXL)
+		return false;
+
+	return true;
+}
+
 static int vfio_pci_init_dev(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+	struct pci_dev *pdev = to_pci_dev(core_vdev->dev);
 
 	/*
 	 * These behaviors originated in vfio-pci and moved into
@@ -140,6 +200,7 @@ static int vfio_pci_init_dev(struct vfio_device *core_vdev)
 	 */
 	vdev->nointxmask = nointxmask;
 	vdev->disable_idle_d3 = disable_idle_d3;
+	vdev->pci_recovery_supported = vfio_pci_supports_recovery(pdev);
 #ifdef CONFIG_VFIO_PCI_VGA
 	vdev->disable_vga = disable_vga;
 #endif
