@@ -1474,16 +1474,11 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 	return ret;
 }
 
-static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
-				void __user *arg)
+static long vfio_pci_access_reset(struct vfio_pci_core_device *vdev, void *data)
 {
 	int ret;
 
-	if (!vdev->reset_works)
-		return -EINVAL;
-
-	vfio_pci_zap_and_down_write_memory_lock(vdev);
-
+	lockdep_assert_held_write(&vdev->memory_lock);
 	/*
 	 * This function can be invoked while the power state is non-D0. If
 	 * pci_try_reset_function() has been called while the power state is
@@ -1494,17 +1489,27 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 	 * 'vdev->pm_save').
 	 */
 	ret = vfio_pci_try_set_power_state(vdev, PCI_D0);
-	if (ret) {
-		up_write(&vdev->memory_lock);
+	if (ret)
 		return ret;
-	}
-
 	vfio_pci_dma_buf_move(vdev, true);
 	ret = pci_try_reset_function(vdev->pdev);
 	if (__vfio_pci_memory_enabled(vdev))
 		vfio_pci_dma_buf_move(vdev, false);
-	up_write(&vdev->memory_lock);
+	return ret;
+}
 
+static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
+				void __user *arg)
+{
+	int ret;
+
+	if (!vdev->reset_works)
+		return -EINVAL;
+
+	vfio_pci_zap_and_down_write_memory_lock(vdev);
+	/* Keep D0 preparation and reset together under memory_lock and SRCU. */
+	ret = vfio_pci_core_access(vdev, vfio_pci_access_reset, NULL);
+	up_write(&vdev->memory_lock);
 	return ret;
 }
 
