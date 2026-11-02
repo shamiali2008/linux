@@ -454,9 +454,11 @@ int vfio_pci_try_set_power_state(struct vfio_pci_core_device *vdev,
 					pci_set_power_state);
 }
 
-static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
-				     struct eventfd_ctx *efdctx)
+static long vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
+				      void *data)
 {
+	struct eventfd_ctx *efdctx = data;
+
 	/*
 	 * The vdev power related flags are protected with 'memory_lock'
 	 * semaphore.
@@ -492,7 +494,7 @@ static int vfio_pci_core_pm_entry(struct vfio_pci_core_device *vdev, u32 flags,
 	 * while returning from the ioctl and then the device can go into
 	 * runtime suspended state.
 	 */
-	return vfio_pci_runtime_pm_entry(vdev, NULL);
+	return vfio_pci_core_access(vdev, vfio_pci_runtime_pm_entry, NULL);
 }
 
 static int vfio_pci_core_pm_entry_with_wakeup(
@@ -519,7 +521,7 @@ static int vfio_pci_core_pm_entry_with_wakeup(
 	if (IS_ERR(efdctx))
 		return PTR_ERR(efdctx);
 
-	ret = vfio_pci_runtime_pm_entry(vdev, efdctx);
+	ret = vfio_pci_core_access(vdev, vfio_pci_runtime_pm_entry, efdctx);
 	if (ret)
 		eventfd_ctx_put(efdctx);
 
@@ -552,6 +554,13 @@ static void vfio_pci_runtime_pm_exit(struct vfio_pci_core_device *vdev)
 	up_write(&vdev->memory_lock);
 }
 
+static long vfio_pci_access_pm_exit(struct vfio_pci_core_device *vdev,
+				    void *data)
+{
+	vfio_pci_runtime_pm_exit(vdev);
+	return 0;
+}
+
 static int vfio_pci_core_pm_exit(struct vfio_pci_core_device *vdev, u32 flags,
 				 void __user *arg, size_t argsz)
 {
@@ -568,8 +577,7 @@ static int vfio_pci_core_pm_exit(struct vfio_pci_core_device *vdev, u32 flags,
 	 * already signaled the eventfd and exited low power mode itself.
 	 * pm_runtime_engaged protects the redundant call here.
 	 */
-	vfio_pci_runtime_pm_exit(vdev);
-	return 0;
+	return vfio_pci_core_access(vdev, vfio_pci_access_pm_exit, NULL);
 }
 
 #ifdef CONFIG_PM
