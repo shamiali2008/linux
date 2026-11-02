@@ -73,6 +73,21 @@ u16 vfio_pci_memory_lock_and_enable(struct vfio_pci_core_device *vdev);
 void vfio_pci_memory_unlock_and_restore(struct vfio_pci_core_device *vdev,
 					u16 cmd);
 
+/* Operations receive kernel buffers only. User copies stay outside SRCU. */
+typedef long (*vfio_pci_access_fn)(struct vfio_pci_core_device *vdev,
+				 void *data);
+long vfio_pci_core_access(struct vfio_pci_core_device *vdev,
+			  vfio_pci_access_fn fn, void *data);
+
+struct vfio_pci_access_ops {
+	/* Select and call within SRCU. The callback receives kernel buffers. */
+	long (*execute)(struct vfio_pci_core_device *vdev,
+			vfio_pci_access_fn fn, void *data);
+};
+
+const struct vfio_pci_access_ops *
+vfio_pci_access_ops(struct vfio_pci_core_device *vdev);
+
 #ifdef CONFIG_VFIO_PCI_IGD
 bool vfio_pci_is_intel_display(struct pci_dev *pdev);
 int vfio_pci_igd_init(struct vfio_pci_core_device *vdev);

@@ -14,6 +14,7 @@
 #include <linux/vfio.h>
 #include <linux/irqbypass.h>
 #include <linux/rcupdate.h>
+#include <linux/srcu.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
 #include <linux/notifier.h>
@@ -97,6 +98,8 @@ static inline int vfio_pci_core_get_dmabuf_phys(
 }
 #endif
 
+struct vfio_pci_access_ops;
+
 struct vfio_pci_core_device {
 	struct vfio_device	vdev;
 	struct pci_dev		*pdev;
@@ -131,6 +134,7 @@ struct vfio_pci_core_device {
 	bool			disable_idle_d3:1;
 	bool			nointxmask:1;
 	bool			disable_vga:1;
+	bool			pci_recovery_supported:1;
 	/* Flags modified at runtime - dedicated storage unit */
 	bool			needs_reset;
 	bool			pm_intx_masked;
@@ -150,6 +154,12 @@ struct vfio_pci_core_device {
 	struct vfio_pci_core_device	*sriov_pf_core_dev;
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
+	struct srcu_struct	access_srcu;
+	/* Updated under access_lock. */
+	const struct vfio_pci_access_ops __rcu *access_ops;
+	/* Set after open completes, cleared before close tears down state. */
+	bool			device_open;
+	struct mutex		access_lock;	/* protects changes to access ops and flags */
 	struct list_head	dmabufs;
 };
 

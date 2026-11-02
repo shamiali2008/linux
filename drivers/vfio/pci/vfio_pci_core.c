@@ -312,6 +312,65 @@ static void vfio_pci_probe_power_state(struct vfio_pci_core_device *vdev)
 	vdev->needs_pm_restore = !(pmcsr & PCI_PM_CTRL_NO_SOFT_RESET);
 }
 
+static long vfio_pci_access_live(struct vfio_pci_core_device *vdev,
+				 vfio_pci_access_fn fn, void *data)
+{
+	return fn(vdev, data);
+}
+
+static long vfio_pci_access_blocked(struct vfio_pci_core_device *vdev,
+				    vfio_pci_access_fn fn, void *data)
+{
+	return -EIO;
+}
+
+static const struct vfio_pci_access_ops vfio_pci_live_ops = {
+	.execute = vfio_pci_access_live,
+};
+
+static const struct vfio_pci_access_ops vfio_pci_blocked_ops = {
+	.execute = vfio_pci_access_blocked,
+};
+
+/*
+ * The ops tables are static and remain valid across open and close.
+ * Ordinary access callbacks run through vfio_pci_core_access(), which
+ * holds SRCU across table selection and callback execution.
+ */
+const struct vfio_pci_access_ops *
+vfio_pci_access_ops(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->pci_recovery_supported)
+		return &vfio_pci_live_ops;
+	return rcu_dereference_raw(vdev->access_ops);
+}
+
+/* Block new operations and drain ordinary accesses before teardown or recovery. */
+static void vfio_pci_core_block_access(struct vfio_pci_core_device *vdev)
+{
+	lockdep_assert_held(&vdev->access_lock);
+	rcu_assign_pointer(vdev->access_ops, &vfio_pci_blocked_ops);
+
+	synchronize_srcu(&vdev->access_srcu);
+}
+
+long vfio_pci_core_access(struct vfio_pci_core_device *vdev,
+			  vfio_pci_access_fn fn, void *data)
+{
+	const struct vfio_pci_access_ops *ops;
+	long ret;
+	int idx;
+
+	if (!vdev->pci_recovery_supported)
+		return vfio_pci_live_ops.execute(vdev, fn, data);
+
+	idx = srcu_read_lock(&vdev->access_srcu);
+	ops = srcu_dereference(vdev->access_ops, &vdev->access_srcu);
+	ret = ops->execute(vdev, fn, data);
+	srcu_read_unlock(&vdev->access_srcu, idx);
+	return ret;
+}
+
 /*
  * pci_set_power_state() wrapper handling devices which perform a soft reset on
  * D3->D0 transition.  Save state prior to D0/1/2->D3, stash it on the vdev,
@@ -649,10 +708,18 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 	if (!vfio_vga_disabled(vdev) && vfio_pci_is_vga(pdev))
 		vdev->has_vga = true;
 
+	if (vdev->pci_recovery_supported) {
+		ret = init_srcu_struct(&vdev->access_srcu);
+		if (ret)
+			goto out_free_config;
+	}
+
 	vfio_pci_core_map_bars(vdev);
 
 	return 0;
 
+out_free_config:
+	vfio_config_free(vdev);
 out_free_zdev:
 	vfio_pci_zdev_close_device(vdev);
 out_free_state:
@@ -799,6 +866,9 @@ out:
 	/* Put the pm-runtime usage counter acquired during enable */
 	if (!vdev->disable_idle_d3)
 		pm_runtime_put(&pdev->dev);
+
+	if (vdev->pci_recovery_supported)
+		cleanup_srcu_struct(&vdev->access_srcu);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_disable);
 
@@ -806,6 +876,13 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+
+	if (vdev->pci_recovery_supported) {
+		scoped_guard(mutex, &vdev->access_lock) {
+			WRITE_ONCE(vdev->device_open, false);
+			vfio_pci_core_block_access(vdev);
+		}
+	}
 
 	if (vdev->sriov_pf_core_dev) {
 		mutex_lock(&vdev->sriov_pf_core_dev->vf_token->lock);
@@ -838,6 +915,12 @@ void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev)
 		mutex_lock(&vdev->sriov_pf_core_dev->vf_token->lock);
 		vdev->sriov_pf_core_dev->vf_token->users++;
 		mutex_unlock(&vdev->sriov_pf_core_dev->vf_token->lock);
+	}
+
+	if (vdev->pci_recovery_supported) {
+		guard(mutex)(&vdev->access_lock);
+		WRITE_ONCE(vdev->device_open, true);
+		rcu_assign_pointer(vdev->access_ops, &vfio_pci_live_ops);
 	}
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_finish_enable);
@@ -2183,6 +2266,8 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 	if (ret && ret != -EOPNOTSUPP)
 		return ret;
 	INIT_LIST_HEAD(&vdev->dmabufs);
+	mutex_init(&vdev->access_lock);
+	RCU_INIT_POINTER(vdev->access_ops, &vfio_pci_blocked_ops);
 	init_rwsem(&vdev->memory_lock);
 	xa_init(&vdev->ctx);
 
@@ -2197,6 +2282,7 @@ void vfio_pci_core_release_dev(struct vfio_device *core_vdev)
 
 	mutex_destroy(&vdev->igate);
 	mutex_destroy(&vdev->ioeventfds_lock);
+	mutex_destroy(&vdev->access_lock);
 	kfree(vdev->region);
 	kfree(vdev->pm_save);
 }
