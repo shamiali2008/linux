@@ -1342,11 +1342,33 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_ioctl_get_region_info);
 
+/* ERR and REQ do not access hardware. */
+static bool vfio_pci_irq_index_is_device(u32 index)
+{
+	switch (index) {
+	case VFIO_PCI_INTX_IRQ_INDEX:
+	case VFIO_PCI_MSI_IRQ_INDEX:
+	case VFIO_PCI_MSIX_IRQ_INDEX:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static long vfio_pci_access_irq_count(struct vfio_pci_core_device *vdev,
+				      void *data)
+{
+	u32 *index = data;
+
+	return vfio_pci_get_irq_count(vdev, *index);
+}
+
 static int vfio_pci_ioctl_get_irq_info(struct vfio_pci_core_device *vdev,
 				       struct vfio_irq_info __user *arg)
 {
 	unsigned long minsz = offsetofend(struct vfio_irq_info, count);
 	struct vfio_irq_info info;
+	int count;
 
 	if (copy_from_user(&info, arg, minsz))
 		return -EFAULT;
@@ -1365,7 +1387,15 @@ static int vfio_pci_ioctl_get_irq_info(struct vfio_pci_core_device *vdev,
 
 	info.flags = VFIO_IRQ_INFO_EVENTFD;
 
-	info.count = vfio_pci_get_irq_count(vdev, info.index);
+	if (vfio_pci_irq_index_is_device(info.index)) {
+		count = vfio_pci_core_access(vdev, vfio_pci_access_irq_count,
+					     &info.index);
+		if (count < 0)
+			return count;
+		info.count = count;
+	} else {
+		info.count = vfio_pci_get_irq_count(vdev, info.index);
+	}
 
 	if (info.index == VFIO_PCI_INTX_IRQ_INDEX)
 		info.flags |=
@@ -1376,19 +1406,48 @@ static int vfio_pci_ioctl_get_irq_info(struct vfio_pci_core_device *vdev,
 	return copy_to_user(arg, &info, minsz) ? -EFAULT : 0;
 }
 
+struct vfio_pci_irq_access {
+	struct vfio_irq_set *hdr;
+	u8 *data;
+};
+
+static long vfio_pci_access_irqs(struct vfio_pci_core_device *vdev, void *data)
+{
+	struct vfio_pci_irq_access *access = data;
+	struct vfio_irq_set *hdr = access->hdr;
+	int ret;
+
+	mutex_lock(&vdev->igate);
+	ret = vfio_pci_set_irqs_ioctl(vdev, hdr->flags, hdr->index, hdr->start,
+				      hdr->count, access->data);
+	mutex_unlock(&vdev->igate);
+	return ret;
+}
+
 static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 				   struct vfio_irq_set __user *arg)
 {
 	unsigned long minsz = offsetofend(struct vfio_irq_set, count);
 	struct vfio_irq_set hdr;
+	struct vfio_pci_irq_access access = { .hdr = &hdr };
 	u8 *data = NULL;
+	bool device_irq;
 	int max, ret = 0;
 	size_t data_size = 0;
 
 	if (copy_from_user(&hdr, arg, minsz))
 		return -EFAULT;
 
-	max = vfio_pci_get_irq_count(vdev, hdr.index);
+	/* Keep the userspace copy between the two SRCU sections. */
+	device_irq = vfio_pci_irq_index_is_device(hdr.index);
+	if (device_irq) {
+		max = vfio_pci_core_access(vdev, vfio_pci_access_irq_count,
+					   &hdr.index);
+		if (max < 0)
+			return max;
+	} else {
+		max = vfio_pci_get_irq_count(vdev, hdr.index);
+	}
 
 	ret = vfio_set_irqs_validate_and_prepare(&hdr, max, VFIO_PCI_NUM_IRQS,
 						 &data_size);
@@ -1401,12 +1460,15 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 			return PTR_ERR(data);
 	}
 
-	mutex_lock(&vdev->igate);
-
-	ret = vfio_pci_set_irqs_ioctl(vdev, hdr.flags, hdr.index, hdr.start,
-				      hdr.count, data);
-
-	mutex_unlock(&vdev->igate);
+	/*
+	 * IRQ teardown flushes the global virqfd workqueue, so draining SRCU
+	 * can also wait for work on other devices.
+	 */
+	access.data = data;
+	if (device_irq)
+		ret = vfio_pci_core_access(vdev, vfio_pci_access_irqs, &access);
+	else
+		ret = vfio_pci_access_irqs(vdev, &access);
 	kfree(data);
 
 	return ret;
