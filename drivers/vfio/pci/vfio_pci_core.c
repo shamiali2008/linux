@@ -330,14 +330,20 @@ static int vfio_pci_power_blocked(struct vfio_pci_core_device *vdev,
 	return -EIO;
 }
 
+static void vfio_pci_restore_dmabufs_blocked(struct vfio_pci_core_device *vdev)
+{
+}
+
 static const struct vfio_pci_access_ops vfio_pci_live_ops = {
 	.execute = vfio_pci_access_live,
 	.set_power_state = vfio_pci_try_set_power_state,
+	.restore_dmabufs = vfio_pci_dma_buf_restore,
 };
 
 static const struct vfio_pci_access_ops vfio_pci_blocked_ops = {
 	.execute = vfio_pci_access_blocked,
 	.set_power_state = vfio_pci_power_blocked,
+	.restore_dmabufs = vfio_pci_restore_dmabufs_blocked,
 };
 
 /*

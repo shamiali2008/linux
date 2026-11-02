@@ -218,14 +218,67 @@ static int validate_dmabuf_input(struct vfio_device_feature_dma_buf *dma_buf,
 	return 0;
 }
 
+struct vfio_pci_dmabuf_access {
+	struct vfio_pci_dma_buf *priv;
+	struct vfio_device_feature_dma_buf *get_dma_buf;
+	struct vfio_region_dma_range *dma_ranges;
+};
+
+static long vfio_pci_access_dmabuf(struct vfio_pci_core_device *vdev, void *data)
+{
+	struct vfio_pci_dmabuf_access *access = data;
+	struct vfio_pci_dma_buf *priv = access->priv;
+	struct vfio_region_dma_range *dma_ranges = access->dma_ranges;
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	int ret;
+
+	ret = vdev->pci_ops->get_dmabuf_phys(vdev, &priv->provider,
+					     access->get_dma_buf->region_index,
+					     priv->phys_vec, dma_ranges,
+					     priv->nr_ranges);
+	if (ret)
+		return ret;
+
+	if (!vfio_device_try_get_registration(&vdev->vdev))
+		return -ENODEV;
+
+	exp_info.ops = &vfio_pci_dmabuf_ops;
+	exp_info.size = priv->size;
+	exp_info.flags = access->get_dma_buf->open_flags;
+	exp_info.priv = priv;
+
+	priv->dmabuf = dma_buf_export(&exp_info);
+	if (IS_ERR(priv->dmabuf)) {
+		ret = PTR_ERR(priv->dmabuf);
+		goto err_dev_put;
+	}
+
+	kref_init(&priv->kref);
+	init_completion(&priv->comp);
+
+	/* dma_buf_put() now frees priv */
+	INIT_LIST_HEAD(&priv->dmabufs_elm);
+	down_write(&vdev->memory_lock);
+	dma_resv_lock(priv->dmabuf->resv, NULL);
+	priv->revoked = !__vfio_pci_memory_enabled(vdev);
+	list_add_tail(&priv->dmabufs_elm, &vdev->dmabufs);
+	dma_resv_unlock(priv->dmabuf->resv);
+	up_write(&vdev->memory_lock);
+	return 0;
+
+err_dev_put:
+	vfio_device_put_registration(&vdev->vdev);
+	return ret;
+}
+
 int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 				  struct vfio_device_feature_dma_buf __user *arg,
 				  size_t argsz)
 {
 	struct vfio_device_feature_dma_buf get_dma_buf = {};
 	struct vfio_region_dma_range *dma_ranges;
-	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct vfio_pci_dma_buf *priv;
+	struct vfio_pci_dmabuf_access access;
 	size_t length;
 	int ret;
 
@@ -274,43 +327,14 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	priv->vdev = vdev;
 	priv->nr_ranges = get_dma_buf.nr_ranges;
 	priv->size = length;
-	ret = vdev->pci_ops->get_dmabuf_phys(vdev, &priv->provider,
-					     get_dma_buf.region_index,
-					     priv->phys_vec, dma_ranges,
-					     priv->nr_ranges);
+
+	access.priv = priv;
+	access.get_dma_buf = &get_dma_buf;
+	access.dma_ranges = dma_ranges;
+	ret = vfio_pci_core_access(vdev, vfio_pci_access_dmabuf, &access);
 	if (ret)
 		goto err_free_phys;
-
 	kfree(dma_ranges);
-	dma_ranges = NULL;
-
-	if (!vfio_device_try_get_registration(&vdev->vdev)) {
-		ret = -ENODEV;
-		goto err_free_phys;
-	}
-
-	exp_info.ops = &vfio_pci_dmabuf_ops;
-	exp_info.size = priv->size;
-	exp_info.flags = get_dma_buf.open_flags;
-	exp_info.priv = priv;
-
-	priv->dmabuf = dma_buf_export(&exp_info);
-	if (IS_ERR(priv->dmabuf)) {
-		ret = PTR_ERR(priv->dmabuf);
-		goto err_dev_put;
-	}
-
-	kref_init(&priv->kref);
-	init_completion(&priv->comp);
-
-	/* dma_buf_put() now frees priv */
-	INIT_LIST_HEAD(&priv->dmabufs_elm);
-	down_write(&vdev->memory_lock);
-	dma_resv_lock(priv->dmabuf->resv, NULL);
-	priv->revoked = !__vfio_pci_memory_enabled(vdev);
-	list_add_tail(&priv->dmabufs_elm, &vdev->dmabufs);
-	dma_resv_unlock(priv->dmabuf->resv);
-	up_write(&vdev->memory_lock);
 
 	/*
 	 * dma_buf_fd() consumes the reference, when the file closes the dmabuf
@@ -322,8 +346,6 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 
 	return ret;
 
-err_dev_put:
-	vfio_device_put_registration(&vdev->vdev);
 err_free_phys:
 	kfree(priv->phys_vec);
 err_free_priv:
@@ -333,7 +355,7 @@ err_free_ranges:
 	return ret;
 }
 
-void vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
+static void __vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
 {
 	struct vfio_pci_dma_buf *priv;
 	struct vfio_pci_dma_buf *tmp;
@@ -403,4 +425,19 @@ void vfio_pci_dma_buf_cleanup(struct vfio_pci_core_device *vdev)
 		fput(priv->dmabuf->file);
 	}
 	up_write(&vdev->memory_lock);
+}
+
+/* Recovery may restore mappings while ordinary access is blocked. */
+void vfio_pci_dma_buf_restore(struct vfio_pci_core_device *vdev)
+{
+	__vfio_pci_dma_buf_move(vdev, false);
+}
+
+void vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
+{
+	lockdep_assert_held_write(&vdev->memory_lock);
+	if (revoked)
+		__vfio_pci_dma_buf_move(vdev, true);
+	else
+		vfio_pci_access_ops(vdev)->restore_dmabufs(vdev);
 }
