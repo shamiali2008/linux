@@ -111,8 +111,13 @@ struct perm_bits {
 	u8	*write;		/* writeable bits */
 	int	(*readfn)(struct vfio_pci_core_device *vdev, int pos, int count,
 			  struct perm_bits *perm, int offset, __le32 *val);
+	/*
+	 * Set power_up for D0 requests. The caller performs the transition
+	 * after leaving SRCU.
+	 */
 	int	(*writefn)(struct vfio_pci_core_device *vdev, int pos, int count,
-			   struct perm_bits *perm, int offset, __le32 val);
+			   struct perm_bits *perm, int offset, __le32 val,
+			   bool *power_up);
 };
 
 #define	NO_VIRT		0
@@ -200,7 +205,8 @@ static int vfio_default_config_read(struct vfio_pci_core_device *vdev, int pos,
 
 static int vfio_default_config_write(struct vfio_pci_core_device *vdev, int pos,
 				     int count, struct perm_bits *perm,
-				     int offset, __le32 val)
+				     int offset, __le32 val,
+				     bool *power_up)
 {
 	__le32 virt = 0, write = 0;
 
@@ -272,7 +278,8 @@ static int vfio_direct_config_read(struct vfio_pci_core_device *vdev, int pos,
 /* Raw access skips any kind of virtualization */
 static int vfio_raw_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 bool *power_up)
 {
 	int ret;
 
@@ -299,7 +306,8 @@ static int vfio_raw_config_read(struct vfio_pci_core_device *vdev, int pos,
 /* Virt access uses only virtualization */
 static int vfio_virt_config_write(struct vfio_pci_core_device *vdev, int pos,
 				  int count, struct perm_bits *perm,
-				  int offset, __le32 val)
+				  int offset, __le32 val,
+				  bool *power_up)
 {
 	memcpy(vdev->vconfig + pos, &val, count);
 	return count;
@@ -563,7 +571,8 @@ static bool vfio_need_bar_restore(struct vfio_pci_core_device *vdev)
 
 static int vfio_basic_config_write(struct vfio_pci_core_device *vdev, int pos,
 				   int count, struct perm_bits *perm,
-				   int offset, __le32 val)
+				   int offset, __le32 val,
+				   bool *power_up)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	__le16 *virt_cmd;
@@ -613,7 +622,8 @@ static int vfio_basic_config_write(struct vfio_pci_core_device *vdev, int pos,
 			vfio_bar_restore(vdev);
 	}
 
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  power_up);
 	if (count < 0) {
 		if (offset == PCI_COMMAND)
 			up_write(&vdev->memory_lock);
@@ -707,11 +717,13 @@ static int __init init_pci_cap_basic_perm(struct perm_bits *perm)
 
 /*
  * It takes all the required locks to protect the access of power related
- * variables and then invokes vfio_pci_set_power_state().
+ * variables and then invokes the selected power-state operation.
  */
-static void vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
-					  pci_power_t state)
+int vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
+				  pci_power_t state)
 {
+	int ret;
+
 	if (state >= PCI_D3hot) {
 		vfio_pci_zap_and_down_write_memory_lock(vdev);
 		vfio_pci_dma_buf_move(vdev, true);
@@ -719,27 +731,36 @@ static void vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
 		down_write(&vdev->memory_lock);
 	}
 
-	vfio_pci_set_power_state(vdev, state);
+	ret = vfio_pci_access_ops(vdev)->set_power_state(vdev, state);
 	if (__vfio_pci_memory_enabled(vdev))
 		vfio_pci_dma_buf_move(vdev, false);
 	up_write(&vdev->memory_lock);
+
+	return ret;
 }
 
 static int vfio_pm_config_write(struct vfio_pci_core_device *vdev, int pos,
 				int count, struct perm_bits *perm,
-				int offset, __le32 val)
+				int offset, __le32 val,
+				bool *power_up)
 {
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  power_up);
 	if (count < 0)
 		return count;
 
 	if (offset == PCI_PM_CTRL) {
 		pci_power_t state;
+		int ret;
 
 		switch (le32_to_cpu(val) & PCI_PM_CTRL_STATE_MASK) {
 		case 0:
-			state = PCI_D0;
-			break;
+			/*
+			 * Request D0 after leaving access_srcu. Otherwise, the ASPM update can
+			 * wait for the bus lock while AER waits for this SRCU reader.
+			 */
+			*power_up = true;
+			return count;
 		case 1:
 			state = PCI_D1;
 			break;
@@ -751,7 +772,9 @@ static int vfio_pm_config_write(struct vfio_pci_core_device *vdev, int pos,
 			break;
 		}
 
-		vfio_lock_and_set_power_state(vdev, state);
+		ret = vfio_lock_and_set_power_state(vdev, state);
+		if (ret)
+			return ret;
 	}
 
 	return count;
@@ -799,7 +822,8 @@ static int __init init_pci_cap_pm_perm(struct perm_bits *perm)
 
 static int vfio_vpd_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 bool *power_up)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	__le16 *paddr = (__le16 *)(vdev->vconfig + pos - offset + PCI_VPD_ADDR);
@@ -812,7 +836,8 @@ static int vfio_vpd_config_write(struct vfio_pci_core_device *vdev, int pos,
 	 * of PCI_VPD_ADDR, then the PCI_VPD_ADDR_F bit is written and we
 	 * have work to do.
 	 */
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  power_up);
 	if (count < 0 || offset > PCI_VPD_ADDR + 1 ||
 	    offset + count <= PCI_VPD_ADDR + 1)
 		return count;
@@ -881,13 +906,15 @@ static int __init init_pci_cap_pcix_perm(struct perm_bits *perm)
 
 static int vfio_exp_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 bool *power_up)
 {
 	__le16 *ctrl = (__le16 *)(vdev->vconfig + pos -
 				  offset + PCI_EXP_DEVCTL);
 	int readrq = le16_to_cpu(*ctrl) & PCI_EXP_DEVCTL_READRQ;
 
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  power_up);
 	if (count < 0)
 		return count;
 
@@ -968,11 +995,13 @@ static int __init init_pci_cap_exp_perm(struct perm_bits *perm)
 
 static int vfio_af_config_write(struct vfio_pci_core_device *vdev, int pos,
 				int count, struct perm_bits *perm,
-				int offset, __le32 val)
+				int offset, __le32 val,
+				bool *power_up)
 {
 	u8 *ctrl = vdev->vconfig + pos - offset + PCI_AF_CTRL;
 
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  power_up);
 	if (count < 0)
 		return count;
 
@@ -1168,9 +1197,11 @@ static int vfio_msi_config_read(struct vfio_pci_core_device *vdev, int pos,
 
 static int vfio_msi_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
-				 int offset, __le32 val)
+				 int offset, __le32 val,
+				 bool *power_up)
 {
-	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val,
+					  power_up);
 	if (count < 0)
 		return count;
 
@@ -1881,6 +1912,28 @@ static size_t vfio_pci_cap_remaining_dword(struct vfio_pci_core_device *vdev,
 	return i;
 }
 
+struct vfio_pci_config_access {
+	struct perm_bits *perm;
+	loff_t pos;
+	int count;
+	int offset;
+	__le32 val;
+	bool power_up;
+	bool iswrite;
+};
+
+static long vfio_pci_access_config(struct vfio_pci_core_device *vdev, void *data)
+{
+	struct vfio_pci_config_access *access = data;
+	struct perm_bits *perm = access->perm;
+
+	if (access->iswrite)
+		return perm->writefn(vdev, access->pos, access->count, perm,
+				     access->offset, access->val, &access->power_up);
+	return perm->readfn(vdev, access->pos, access->count, perm,
+			    access->offset, &access->val);
+}
+
 ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 				  char __user *buf, size_t count, loff_t *ppos,
 				  bool iswrite)
@@ -1889,6 +1942,7 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 	struct perm_bits *perm;
 	__le32 val = 0;
 	int cap_start = 0, offset;
+	struct vfio_pci_config_access access = {};
 	u8 cap_id;
 	ssize_t ret;
 
@@ -1949,6 +2003,12 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 	WARN_ON(cap_start > *ppos);
 
 	offset = *ppos - cap_start;
+	access.perm = perm;
+	access.pos = *ppos;
+	access.count = count;
+	access.offset = offset;
+	access.iswrite = iswrite;
+
 
 	if (iswrite) {
 		if (!perm->writefn)
@@ -1957,11 +2017,21 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 		if (copy_from_user(&val, buf, count))
 			return -EFAULT;
 
-		ret = perm->writefn(vdev, *ppos, count, perm, offset, val);
+		access.val = val;
+		ret = vfio_pci_core_access(vdev, vfio_pci_access_config, &access);
+		if (ret < 0)
+			return ret;
+		if (access.power_up) {
+			int err = vfio_lock_and_set_power_state(vdev, PCI_D0);
+
+			if (err)
+				return err;
+		}
 	} else {
 		if (perm->readfn) {
-			ret = perm->readfn(vdev, *ppos, count,
-					   perm, offset, &val);
+			access.val = val;
+			ret = vfio_pci_core_access(vdev, vfio_pci_access_config, &access);
+			val = access.val;
 			if (ret < 0)
 				return ret;
 		}
