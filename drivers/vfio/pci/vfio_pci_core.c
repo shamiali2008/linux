@@ -1880,6 +1880,24 @@ vm_fault_t vfio_pci_vmf_insert_pfn(struct vfio_pci_core_device *vdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_vmf_insert_pfn);
 
+struct vfio_pci_fault_access {
+	struct vm_fault *vmf;
+	unsigned long pfn;
+	unsigned int order;
+};
+
+static long vfio_pci_access_fault(struct vfio_pci_core_device *vdev, void *data)
+{
+	struct vfio_pci_fault_access *access = data;
+	vm_fault_t ret;
+
+	down_read(&vdev->memory_lock);
+	ret = vfio_pci_vmf_insert_pfn(vdev, access->vmf, access->pfn,
+				      access->order);
+	up_read(&vdev->memory_lock);
+	return (__force unsigned int)ret;
+}
+
 static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
 					   unsigned int order)
 {
@@ -1891,8 +1909,12 @@ static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	if (is_aligned_for_order(vma, addr, pfn, order)) {
-		scoped_guard(rwsem_read, &vdev->memory_lock)
-			ret = vfio_pci_vmf_insert_pfn(vdev, vmf, pfn, order);
+		struct vfio_pci_fault_access access = { vmf, pfn, order };
+		long result;
+
+		/* Recovery must wait for this insertion before removing mappings. */
+		result = vfio_pci_core_access(vdev, vfio_pci_access_fault, &access);
+		ret = result < 0 ? VM_FAULT_SIGBUS : (__force vm_fault_t)result;
 	}
 
 	dev_dbg_ratelimited(&vdev->pdev->dev,
