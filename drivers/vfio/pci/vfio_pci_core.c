@@ -1178,6 +1178,33 @@ static int vfio_pci_info_atomic_cap(struct vfio_pci_core_device *vdev,
 	return vfio_info_add_capability(caps, &cap.header, sizeof(cap));
 }
 
+static long vfio_pci_access_atomic_cap_target(struct vfio_pci_core_device *vdev,
+					      void *data)
+{
+	return vfio_pci_info_atomic_cap(vdev, data);
+}
+
+static long vfio_pci_access_atomic_cap(struct vfio_pci_core_device *vdev,
+				       void *data)
+{
+	struct vfio_pci_core_device *pf_vdev = vdev->sriov_pf_core_dev;
+
+	if (!pf_vdev || !pf_vdev->pci_recovery_supported)
+		return vfio_pci_info_atomic_cap(vdev, data);
+
+	/*
+	 * VF AtomicOps queries read the PF's configuration. The PF association
+	 * lasts until VF removal, but its SRCU instance exists only while
+	 * the PF is open.
+	 */
+	guard(mutex)(&pf_vdev->access_lock);
+	if (!pf_vdev->device_open)
+		return -EIO;
+
+	return vfio_pci_core_access(pf_vdev, vfio_pci_access_atomic_cap_target,
+				    data);
+}
+
 static int vfio_pci_ioctl_get_info(struct vfio_pci_core_device *vdev,
 				   struct vfio_device_info __user *arg)
 {
@@ -1209,10 +1236,12 @@ static int vfio_pci_ioctl_get_info(struct vfio_pci_core_device *vdev,
 		return ret;
 	}
 
-	ret = vfio_pci_info_atomic_cap(vdev, &caps);
+	ret = vfio_pci_core_access(vdev, vfio_pci_access_atomic_cap, &caps);
 	if (ret && ret != -ENODEV) {
-		pci_warn(vdev->pdev,
-			 "Failed to setup AtomicOps info capability\n");
+		if (ret != -EIO)
+			pci_warn(vdev->pdev,
+				 "Failed to setup AtomicOps info capability\n");
+		kfree(caps.buf);
 		return ret;
 	}
 
@@ -1233,6 +1262,31 @@ static int vfio_pci_ioctl_get_info(struct vfio_pci_core_device *vdev,
 	}
 
 	return copy_to_user(arg, &info, minsz) ? -EFAULT : 0;
+}
+
+static long vfio_pci_access_rom_info(struct vfio_pci_core_device *vdev,
+				     void *data)
+{
+	struct vfio_region_info *info = data;
+	struct pci_dev *pdev = vdev->pdev;
+	void __iomem *io;
+	size_t size;
+	u16 cmd;
+
+	/*
+	 * Check ROM content is valid. Need to enable memory
+	 * decode for ROM access in pci_map_rom().
+	 */
+	cmd = vfio_pci_memory_lock_and_enable(vdev);
+	io = pci_map_rom(pdev, &size);
+	if (io) {
+		info->flags = VFIO_REGION_INFO_FLAG_READ;
+		/* Report the BAR size, not the ROM size. */
+		info->size = pci_resource_len(pdev, PCI_ROM_RESOURCE);
+		pci_unmap_rom(pdev, io);
+	}
+	vfio_pci_memory_unlock_and_restore(vdev, cmd);
+	return 0;
 }
 
 int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
@@ -1272,29 +1326,15 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 
 		break;
 	case VFIO_PCI_ROM_REGION_INDEX: {
-		void __iomem *io;
-		size_t size;
-		u16 cmd;
-
 		info->offset = VFIO_PCI_INDEX_TO_OFFSET(info->index);
 		info->flags = 0;
 		info->size = 0;
 
 		if (pci_resource_start(pdev, PCI_ROM_RESOURCE)) {
-			/*
-			 * Check ROM content is valid. Need to enable memory
-			 * decode for ROM access in pci_map_rom().
-			 */
-			cmd = vfio_pci_memory_lock_and_enable(vdev);
-			io = pci_map_rom(pdev, &size);
-			if (io) {
-				info->flags = VFIO_REGION_INFO_FLAG_READ;
-				/* Report the BAR size, not the ROM size. */
-				info->size = pci_resource_len(pdev,
-							      PCI_ROM_RESOURCE);
-				pci_unmap_rom(pdev, io);
-			}
-			vfio_pci_memory_unlock_and_restore(vdev, cmd);
+			ret = vfio_pci_core_access(vdev, vfio_pci_access_rom_info,
+						   info);
+			if (ret)
+				return ret;
 		} else if (pdev->rom && pdev->romlen) {
 			info->flags = VFIO_REGION_INFO_FLAG_READ;
 			/* Report BAR size as power of two. */
