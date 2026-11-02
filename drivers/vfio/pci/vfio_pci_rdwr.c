@@ -40,57 +40,81 @@
 #define vfio_ioread8	ioread8
 #define vfio_iowrite8	iowrite8
 
-#define VFIO_IOWRITE(size) \
-int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,	\
-			bool test_mem, u##size val, void __iomem *io)	\
-{									\
-	if (test_mem) {							\
-		down_read(&vdev->memory_lock);				\
-		if (!__vfio_pci_memory_enabled(vdev)) {			\
-			up_read(&vdev->memory_lock);			\
-			return -EIO;					\
-		}							\
-	}								\
-									\
-	vfio_iowrite##size(val, io);					\
-									\
-	if (test_mem)							\
-		up_read(&vdev->memory_lock);				\
-									\
-	return 0;							\
-}									\
-EXPORT_SYMBOL_GPL(vfio_pci_core_iowrite##size);
+struct vfio_pci_io_access {
+	bool test_mem;
+	void __iomem *io;
+	void *val;
+};
 
-VFIO_IOWRITE(8)
-VFIO_IOWRITE(16)
-VFIO_IOWRITE(32)
-VFIO_IOWRITE(64)
+#define VFIO_IOWRITE(size, type)						\
+static long vfio_pci_access_iowrite##size(struct vfio_pci_core_device *vdev,	\
+					       void *data)			\
+{										\
+	struct vfio_pci_io_access *access = data;				\
+	type *val = access->val;						\
+										\
+	if (access->test_mem) {							\
+		down_read(&vdev->memory_lock);					\
+		if (!__vfio_pci_memory_enabled(vdev)) {				\
+			up_read(&vdev->memory_lock);				\
+			return -EIO;						\
+		}								\
+	}									\
+										\
+	vfio_iowrite##size(*val, access->io);					\
+	if (access->test_mem)							\
+		up_read(&vdev->memory_lock);					\
+	return 0;								\
+}										\
+										\
+int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,		\
+			 bool test_mem, type val, void __iomem *io)		\
+{										\
+	struct vfio_pci_io_access access = { test_mem, io, &val };		\
+										\
+	return vfio_pci_core_access(vdev, vfio_pci_access_iowrite##size, &access);	\
+}										\
+EXPORT_SYMBOL_GPL(vfio_pci_core_iowrite##size)
 
-#define VFIO_IOREAD(size) \
-int vfio_pci_core_ioread##size(struct vfio_pci_core_device *vdev,	\
-			bool test_mem, u##size *val, void __iomem *io)	\
-{									\
-	if (test_mem) {							\
-		down_read(&vdev->memory_lock);				\
-		if (!__vfio_pci_memory_enabled(vdev)) {			\
-			up_read(&vdev->memory_lock);			\
-			return -EIO;					\
-		}							\
-	}								\
-									\
-	*val = vfio_ioread##size(io);					\
-									\
-	if (test_mem)							\
-		up_read(&vdev->memory_lock);				\
-									\
-	return 0;							\
-}									\
-EXPORT_SYMBOL_GPL(vfio_pci_core_ioread##size);
+VFIO_IOWRITE(8, u8);
+VFIO_IOWRITE(16, u16);
+VFIO_IOWRITE(32, u32);
+VFIO_IOWRITE(64, u64);
 
-VFIO_IOREAD(8)
-VFIO_IOREAD(16)
-VFIO_IOREAD(32)
-VFIO_IOREAD(64)
+#define VFIO_IOREAD(size, type)							\
+static long vfio_pci_access_ioread##size(struct vfio_pci_core_device *vdev,	\
+					       void *data)			\
+{										\
+	struct vfio_pci_io_access *access = data;				\
+	type *val = access->val;						\
+										\
+	if (access->test_mem) {							\
+		down_read(&vdev->memory_lock);					\
+		if (!__vfio_pci_memory_enabled(vdev)) {				\
+			up_read(&vdev->memory_lock);				\
+			return -EIO;						\
+		}								\
+	}									\
+										\
+	*val = vfio_ioread##size(access->io);					\
+	if (access->test_mem)							\
+		up_read(&vdev->memory_lock);					\
+	return 0;								\
+}										\
+										\
+int vfio_pci_core_ioread##size(struct vfio_pci_core_device *vdev,		\
+			 bool test_mem, type *val, void __iomem *io)		\
+{										\
+	struct vfio_pci_io_access access = { test_mem, io, val };		\
+										\
+	return vfio_pci_core_access(vdev, vfio_pci_access_ioread##size, &access);	\
+}										\
+EXPORT_SYMBOL_GPL(vfio_pci_core_ioread##size)
+
+VFIO_IOREAD(8, u8);
+VFIO_IOREAD(16, u16);
+VFIO_IOREAD(32, u32);
+VFIO_IOREAD(64, u64);
 
 #define VFIO_IORDWR(size)						\
 static int vfio_pci_iordwr##size(struct vfio_pci_core_device *vdev,\
@@ -200,12 +224,20 @@ ssize_t vfio_pci_core_do_io_rw(struct vfio_pci_core_device *vdev, bool test_mem,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_do_io_rw);
 
-static ssize_t vfio_pci_rom_read(struct vfio_pci_core_device *vdev,
-				 char __user *buf, size_t count, loff_t pos)
+struct vfio_pci_rom_access {
+	size_t count;
+	loff_t pos;
+	void *data;
+	size_t length;
+};
+
+static long vfio_pci_access_rom(struct vfio_pci_core_device *vdev, void *arg)
 {
+	struct vfio_pci_rom_access *access = arg;
 	struct pci_dev *pdev = vdev->pdev;
 	bool rom_bar = pci_resource_start(pdev, PCI_ROM_RESOURCE);
-	size_t size, length = 0, done = 0;
+	size_t count = access->count, size, length = 0, done = 0;
+	loff_t pos = access->pos;
 	void *data = NULL;
 	void __iomem *io;
 	ssize_t ret;
@@ -272,6 +304,22 @@ out_unmap:
 		iounmap(io);
 out_unlock:
 	up_write(&vdev->memory_lock);
+	access->data = data;
+	access->length = length;
+	return ret;
+}
+
+static ssize_t vfio_pci_rom_read(struct vfio_pci_core_device *vdev,
+				 char __user *buf, size_t count, loff_t pos)
+{
+	struct vfio_pci_rom_access access = { .count = count, .pos = pos };
+	size_t length, done;
+	void *data;
+	ssize_t ret;
+
+	ret = vfio_pci_core_access(vdev, vfio_pci_access_rom, &access);
+	data = access.data;
+	length = access.length;
 	if (ret < 0)
 		goto out_free;
 
