@@ -378,7 +378,10 @@ long vfio_pci_core_access(struct vfio_pci_core_device *vdev,
  * by PM capability emulation and separately from pci_dev internal saved state
  * to avoid it being overwritten and consumed around other resets.
  */
-int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t state)
+static int __vfio_pci_set_power_state(struct vfio_pci_core_device *vdev,
+				      pci_power_t state,
+				      int (*set_power_state)(struct pci_dev *,
+							     pci_power_t))
 {
 	struct pci_dev *pdev = vdev->pdev;
 	bool needs_restore = false, needs_save = false;
@@ -401,7 +404,7 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 			needs_restore = true;
 	}
 
-	ret = pci_set_power_state(pdev, state);
+	ret = set_power_state(pdev, state);
 
 	if (!ret) {
 		/* D3 might be unsupported via quirk, skip unless in D3 */
@@ -427,6 +430,20 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 	}
 
 	return ret;
+}
+
+int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t state)
+{
+	return __vfio_pci_set_power_state(vdev, state, pci_set_power_state);
+}
+
+/* Avoid waiting for pci_bus_sem under locks needed by PCI recovery. */
+int vfio_pci_try_set_power_state(struct vfio_pci_core_device *vdev,
+				 pci_power_t state)
+{
+	return __vfio_pci_set_power_state(vdev, state,
+					state == PCI_D0 ? pci_try_set_power_state :
+					pci_set_power_state);
 }
 
 static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
@@ -550,6 +567,8 @@ static int vfio_pci_core_pm_exit(struct vfio_pci_core_device *vdev, u32 flags,
 #ifdef CONFIG_PM
 int vfio_pci_core_runtime_suspend(struct vfio_pci_core_device *vdev)
 {
+	int ret;
+
 	down_write(&vdev->memory_lock);
 	/*
 	 * The user can move the device into D3hot state before invoking
@@ -559,8 +578,11 @@ int vfio_pci_core_runtime_suspend(struct vfio_pci_core_device *vdev)
 	 * NoSoftRst-, it will help in restoring the original state
 	 * (saved locally in 'vdev->pm_save').
 	 */
-	vfio_pci_set_power_state(vdev, PCI_D0);
+	ret = vfio_pci_try_set_power_state(vdev, PCI_D0);
 	up_write(&vdev->memory_lock);
+	/* Preserve the existing handling of other D0 transition errors. */
+	if (ret == -EAGAIN)
+		return ret;
 
 	/*
 	 * If INTx is enabled, then mask INTx before going into the runtime
@@ -1401,7 +1423,11 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 	 * reset without restoring the original state (saved locally in
 	 * 'vdev->pm_save').
 	 */
-	vfio_pci_set_power_state(vdev, PCI_D0);
+	ret = vfio_pci_try_set_power_state(vdev, PCI_D0);
+	if (ret) {
+		up_write(&vdev->memory_lock);
+		return ret;
+	}
 
 	vfio_pci_dma_buf_move(vdev, true);
 	ret = pci_try_reset_function(vdev->pdev);
@@ -2453,7 +2479,12 @@ int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
 			goto out_del;
 
 		down_write(&vdev->memory_lock);
-		vfio_pci_set_power_state(vdev, PCI_D0);
+		ret = vfio_pci_try_set_power_state(vdev, PCI_D0);
+		if (ret) {
+			up_write(&vdev->memory_lock);
+			pm_runtime_put(&pdev->dev);
+			goto out_del;
+		}
 		vdev->sriov_active = true;
 		up_write(&vdev->memory_lock);
 		ret = pci_enable_sriov(pdev, nr_virtfn);
@@ -2656,11 +2687,15 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 	 * cause the PCI config space reset without restoring the original
 	 * state (saved locally in 'vdev->pm_save').
 	 */
-	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list)
-		vfio_pci_set_power_state(vdev, PCI_D0);
+	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list) {
+		ret = vfio_pci_try_set_power_state(vdev, PCI_D0);
+		if (ret)
+			goto out_unlock_memory;
+	}
 
 	ret = pci_reset_bus(pdev);
 
+out_unlock_memory:
 	vdev = list_last_entry(&dev_set->device_list,
 			       struct vfio_pci_core_device, vdev.dev_set_list);
 
